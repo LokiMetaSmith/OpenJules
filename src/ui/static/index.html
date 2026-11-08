@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenJules — Autonomous Coding Agent Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="top-nav">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <h1>OpenJules</h1>
+      <span class="badge">v0.3.0</span>
+    </div>
+    <div class="header-status">
+      <span id="swarm-status" class="pill pill-idle">Swarm: Idle</span>
+      <span id="forge-status" class="pill pill-github">GitHub & Radicle</span>
+      <button id="btn-new-task" class="btn btn-primary" onclick="openNewTaskModal()">+ New Task</button>
+    </div>
+  </header>
+
+  <!-- Three Pane Container -->
+  <main class="three-pane-container">
+    <!-- Left Pane: Context, Tasks, & Files -->
+    <section class="pane left-pane" id="pane-context">
+      <div class="pane-header">
+        <h2>Tasks & Backlog</h2>
+        <span class="count-badge" id="task-count">0</span>
+      </div>
+      <div class="pane-content">
+        <div class="section-title">ACTIVE WORKLOAD</div>
+        <div class="task-list" id="task-list">
+          <div class="empty-state">No tasks running. Dispatch one above.</div>
+        </div>
+
+        <div class="section-title" style="margin-top: 20px;">POLYPHONY BATONS & SWARM</div>
+        <div class="baton-list" id="baton-list">
+          <div class="empty-state">No active locks held.</div>
+        </div>
+
+        <div class="section-title" style="margin-top: 20px;">WORKSPACE FILES</div>
+        <div class="file-tree" id="file-tree">
+          <div class="tree-item">📁 src/</div>
+          <div class="tree-item tree-sub">📄 agent/engine.py</div>
+          <div class="tree-item tree-sub">📄 sandbox/docker_driver.py</div>
+          <div class="tree-item">📁 tests/</div>
+          <div class="tree-item">📄 .openjules.yaml</div>
+          <div class="tree-item">📄 EXPERIENCE.md</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Middle Pane: Agent Action & Thought Stream -->
+    <section class="pane middle-pane" id="pane-thoughts">
+      <div class="pane-header">
+        <h2>Agent Execution Stream</h2>
+        <div class="pane-actions">
+          <span id="agent-indicator" class="status-indicator">● Standby</span>
+        </div>
+      </div>
+      <div class="pane-content thought-content" id="thought-stream">
+        <div class="thought-card system-thought">
+          <div class="thought-meta">OpenJules Orchestrator</div>
+          <div class="thought-body">Welcome to OpenJules. Ready to accept tasks from GitHub webhooks, Radicle nodes, or the task dispatcher.</div>
+        </div>
+      </div>
+      <div class="thought-input-bar">
+        <input type="text" id="agent-command-input" placeholder="Type prompt or instruction for agent..." onkeydown="handleInputKey(event)">
+        <button class="btn btn-send" onclick="sendPromptCommand()">Send</button>
+      </div>
+    </section>
+
+    <!-- Right Pane: Diff Viewer & Command Palette -->
+    <section class="pane right-pane" id="pane-diff">
+      <div class="pane-header">
+        <h2>Code Changes & Diff</h2>
+        <div class="diff-controls">
+          <span class="diff-stats" id="diff-stats">+0 -0</span>
+          <button class="btn btn-sm" onclick="fetchCurrentDiff()">Refresh Diff</button>
+        </div>
+      </div>
+      <div class="pane-content diff-viewport" id="diff-viewport">
+        <pre class="diff-code" id="diff-content"><code class="language-diff"># No working changes detected in workspace.
+# When the agent edits files and executes tools, diffs appear here.</code></pre>
+      </div>
+
+      <!-- Command Palette underneath Git Diff -->
+      <div class="diff-command-palette" id="diff-command-palette">
+        <div class="palette-header">
+          <span class="palette-title">⚡ Command Palette</span>
+          <span class="palette-hint">Quick Actions</span>
+        </div>
+        <div class="palette-actions">
+          <button class="btn btn-palette" onclick="runPaletteCommand('verify')">▶ Run Test Suite</button>
+          <button class="btn btn-palette" onclick="runPaletteCommand('commit')">💾 Commit Changes</button>
+          <button class="btn btn-palette" onclick="runPaletteCommand('proposal')">🚀 Open PR / Patch</button>
+          <button class="btn btn-palette" onclick="runPaletteCommand('harness_refine')">🧠 Refine Harness</button>
+        </div>
+        <div class="palette-command-status" id="palette-status">Ready</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- New Task Modal -->
+  <div class="modal-overlay" id="task-modal" style="display: none;">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Dispatch New Autonomous Task</h3>
+        <button class="btn-close" onclick="closeNewTaskModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="task-forge">Forge</label>
+          <select id="task-forge">
+            <option value="github">GitHub</option>
+            <option value="radicle">Radicle (rad:)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="task-repo">Repository Identifier</label>
+          <input type="text" id="task-repo" placeholder="owner/repo or rad:z4V1sJY..." value="openjules/demo-repo">
+        </div>
+        <div class="form-group">
+          <label for="task-title">Issue Title</label>
+          <input type="text" id="task-title" placeholder="e.g. Fix division by zero error in calculator">
+        </div>
+        <div class="form-group">
+          <label for="task-body">Task Instruction / Issue Description</label>
+          <textarea id="task-body" rows="4" placeholder="Detailed requirements and context..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeNewTaskModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitNewTask()">Dispatch Agent</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
