@@ -16,18 +16,23 @@ env:
 
 # LLM inference server configuration (self-hosted or cloud)
 llm:
-  # Model name (e.g. 'openai/Qwen/Qwen2.5-Coder-7B-Instruct' or 'gpt-4o')
   model: "gpt-4o"
-  # Optional base URL for local servers (e.g. 'http://vllm:8000/v1' or 'http://llamacpp:8080/v1')
   api_base: null
   api_key: "EMPTY"
   temperature: 0.2
   max_tokens: 4096
 
+# Adaptive Agent Harness (Harness² Propose-Probe-Compose and EXPERIENCE.md)
+harness:
+  adaptive: true
+  experience_path: "EXPERIENCE.md"
+  max_refinements: 3
+  inject_experience: true
+
 # Keystone Polyphony multi-agent coordination settings
 polyphony:
   enabled: true
-  swarm_key: null  # Optional override
+  swarm_key: null
 
 # Execution timeout in seconds
 timeout_seconds: 900

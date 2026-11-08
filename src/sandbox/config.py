@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 import yaml
 from pydantic import BaseModel, Field
 from src.agent.llm_config import LLMConfig
+from src.harness.config import HarnessConfig
 
 
 class OpenJulesConfig(BaseModel):
@@ -29,6 +30,10 @@ class OpenJulesConfig(BaseModel):
     llm: Optional[LLMConfig] = Field(
         default=None,
         description="Optional repository-level LLM configuration for local/self-hosted or cloud inference.",
+    )
+    harness: HarnessConfig = Field(
+        default_factory=HarnessConfig,
+        description="Adaptive agent harness settings (Propose-Probe-Compose and EXPERIENCE.md persistence).",
     )
     timeout_seconds: int = Field(
         default=900,
