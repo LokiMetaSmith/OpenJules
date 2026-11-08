@@ -1,4 +1,4 @@
-"""Task worker executor running the full OpenJules autonomous coding lifecycle."""
+"""Task worker executor running the full OpenJules autonomous coding lifecycle across forges."""
 
 import logging
 import os
@@ -6,6 +6,9 @@ from typing import Any, Optional
 from github import Github, Auth
 
 from src.agent.engine import AgentEngine
+from src.forge.base import ForgeProvider, ProposalResult
+from src.forge.github import GitHubProvider
+from src.forge.radicle import RadicleProvider
 from src.git_manager.lifecycle import GitLifecycleManager
 from src.sandbox.config import OpenJulesConfig, load_config_from_yaml
 from src.sandbox.docker_driver import SandboxManager
@@ -15,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class TaskExecutor:
-    """Executes an issue task from sandbox spawn through agent run, git push, and PR opening."""
+    """Executes an issue task from sandbox spawn through agent run, git push, and proposal opening."""
 
     def __init__(
         self,
@@ -23,66 +26,38 @@ class TaskExecutor:
         agent_engine: Optional[AgentEngine] = None,
         git_manager: Optional[GitLifecycleManager] = None,
         github_client: Optional[Github] = None,
+        radicle_provider: Optional[RadicleProvider] = None,
     ):
         self.sandbox_manager = sandbox_manager or SandboxManager()
         self.agent_engine = agent_engine or AgentEngine(self.sandbox_manager)
         self.git_manager = git_manager or GitLifecycleManager(self.sandbox_manager)
-        self.github_client = github_client
+        self.github_provider = GitHubProvider(github_client=github_client)
+        self.radicle_provider = radicle_provider or RadicleProvider(sandbox_manager=self.sandbox_manager)
 
-    def _get_github(self) -> Optional[Github]:
-        if self.github_client:
-            return self.github_client
-        token = os.environ.get("GITHUB_TOKEN")
-        if token:
-            return Github(auth=Auth.Token(token))
-        return None
+    def get_forge_provider(self, forge_type: str) -> ForgeProvider:
+        """Retrieves provider for given forge type."""
+        if forge_type.lower() == "radicle":
+            return self.radicle_provider
+        return self.github_provider
 
-    def post_issue_comment(self, repo_name: str, issue_id: int, message: str) -> None:
-        """Posts a comment on the GitHub issue if client is available."""
-        gh = self._get_github()
-        if not gh:
-            logger.info(f"GitHub client not configured. Issue #{issue_id} update:\n{message}")
-            return
-        try:
-            repo = gh.get_repo(repo_name)
-            issue = repo.get_issue(number=issue_id)
-            issue.create_comment(f"🤖 **[OpenJules]** {message}")
-        except Exception as e:
-            logger.warning(f"Failed to post comment to issue #{issue_id}: {e}")
-
-    def create_pull_request(
-        self,
-        repo_name: str,
-        title: str,
-        body: str,
-        head_branch: str,
-        base_branch: str,
-    ) -> Optional[str]:
-        """Opens a Pull Request referencing the completed task."""
-        gh = self._get_github()
-        if not gh:
-            logger.info(f"GitHub client not configured. Would open PR: {head_branch} -> {base_branch}")
-            return None
-        try:
-            repo = gh.get_repo(repo_name)
-            pr = repo.create_pull(
-                title=title,
-                body=body,
-                head=head_branch,
-                base=base_branch,
-            )
-            return pr.html_url
-        except Exception as e:
-            logger.error(f"Failed to create Pull Request for {repo_name}: {e}")
-            return None
+    def post_issue_comment(self, forge_type: str, repo_name: str, issue_id: int | str, message: str) -> None:
+        """Posts a comment on the issue via the active forge provider."""
+        provider = self.get_forge_provider(forge_type)
+        provider.post_issue_comment(repo_name, issue_id, message)
 
     def execute_task(self, payload: TaskPayload, git_token: Optional[str] = None) -> bool:
         """Runs the complete autonomous agent lifecycle."""
-        logger.info(f"Starting task execution for issue #{payload.issue_id} in {payload.repo_full_name}")
+        forge = payload.forge.lower()
+        provider = self.get_forge_provider(forge)
+
+        logger.info(
+            f"Starting task execution for {forge} issue #{payload.issue_id} in {payload.repo_full_name}"
+        )
         self.post_issue_comment(
+            forge,
             payload.repo_full_name,
             payload.issue_id,
-            f"🚀 OpenJules received task: **{payload.issue_title}**. Initializing sandbox...",
+            f"🚀 OpenJules received task ({forge}): **{payload.issue_title}**. Initializing sandbox...",
         )
 
         effective_token = git_token or os.environ.get("GITHUB_TOKEN")
@@ -114,7 +89,7 @@ class TaskExecutor:
                 task_instruction = f"Title: {payload.issue_title}\n\nDescription:\n{payload.issue_body}"
 
                 def on_progress(msg: str):
-                    self.post_issue_comment(payload.repo_full_name, payload.issue_id, msg)
+                    self.post_issue_comment(forge, payload.repo_full_name, payload.issue_id, msg)
 
                 agent_result = self.agent_engine.run(
                     context=context,
@@ -124,6 +99,7 @@ class TaskExecutor:
 
                 if not agent_result.success:
                     self.post_issue_comment(
+                        forge,
                         payload.repo_full_name,
                         payload.issue_id,
                         f"❌ Verification failed after {agent_result.turns_taken} turns. Automated tests did not pass cleanly.",
@@ -135,16 +111,17 @@ class TaskExecutor:
                 sha = self.git_manager.commit_changes(context, commit_msg)
                 if not sha:
                     self.post_issue_comment(
+                        forge,
                         payload.repo_full_name,
                         payload.issue_id,
                         "ℹ️ No file changes were detected to commit.",
                     )
                     return True
 
-                # 5. Push branch to remote
+                # 5. Push branch to remote / radicle storage
                 self.git_manager.push_branch(context, branch_name)
 
-                # 6. Generate PR summary and diff
+                # 6. Generate summary and diff
                 test_output = "Automated test suite verified green."
                 diff_summary = self.git_manager.generate_pr_summary(
                     context,
@@ -155,22 +132,25 @@ class TaskExecutor:
                     base_branch=payload.default_branch,
                 )
 
-                # 7. Create Pull Request
-                pr_url = self.create_pull_request(
-                    repo_name=payload.repo_full_name,
+                # 7. Create Proposal (PR on GitHub, Patch on Radicle)
+                proposal = provider.create_proposal(
+                    repo_identifier=payload.repo_full_name,
                     title=f"fix: {payload.issue_title} (fixes #{payload.issue_id})",
-                    body=diff_summary.summary,
-                    head_branch=branch_name,
-                    base_branch=payload.default_branch,
+                    description=diff_summary.summary,
+                    source_branch=branch_name,
+                    target_branch=payload.default_branch,
+                    context=context,
                 )
 
-                pr_msg = f"🎉 Pull Request successfully opened: {pr_url}" if pr_url else f"🎉 Branch `{branch_name}` successfully pushed."
-                self.post_issue_comment(payload.repo_full_name, payload.issue_id, pr_msg)
+                proposal_kind = "Patch" if forge == "radicle" else "Pull Request"
+                pr_msg = f"🎉 {proposal_kind} successfully opened: `{proposal.url_or_id}`"
+                self.post_issue_comment(forge, payload.repo_full_name, payload.issue_id, pr_msg)
                 return True
 
         except Exception as e:
             logger.exception(f"Fatal error executing task #{payload.issue_id}: {e}")
             self.post_issue_comment(
+                forge,
                 payload.repo_full_name,
                 payload.issue_id,
                 f"⚠️ Fatal error during execution: `{str(e)}`",

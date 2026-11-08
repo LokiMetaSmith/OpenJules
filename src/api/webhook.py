@@ -1,4 +1,4 @@
-"""GitHub App webhook handler and FastAPI control plane."""
+"""GitHub and Radicle Webhook handler and FastAPI control plane."""
 
 import hashlib
 import hmac
@@ -8,7 +8,7 @@ import os
 from typing import Any, Dict, Optional
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.worker.dispatcher import BackgroundTasksDispatcher, TaskDispatcher, TaskPayload
 from src.worker.executor import TaskExecutor
@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="OpenJules Control Plane",
-    description="Autonomous Sandboxed Coding Agent Service API",
-    version="0.1.0",
+    description="Autonomous Sandboxed Coding Agent Service API for GitHub and Radicle",
+    version="0.2.0",
 )
 
 executor = TaskExecutor()
@@ -27,7 +27,6 @@ executor = TaskExecutor()
 def verify_github_signature(payload_body: bytes, signature_header: Optional[str], secret: str) -> bool:
     """Verifies that the webhook payload was sent from GitHub using HMAC-SHA256."""
     if not secret:
-        # If secret is not configured, signature verification is skipped (development mode)
         return True
     if not signature_header:
         return False
@@ -41,7 +40,7 @@ def verify_github_signature(payload_body: bytes, signature_header: Optional[str]
 @app.get("/health")
 def health_check():
     """Service health probe."""
-    return {"status": "ok", "service": "openjules"}
+    return {"status": "ok", "service": "openjules", "forges": ["github", "radicle"]}
 
 
 @app.post("/api/webhook")
@@ -81,6 +80,7 @@ async def github_webhook(
 
         if label_triggered:
             task_payload = TaskPayload(
+                forge="github",
                 issue_id=issue.get("number"),
                 issue_title=issue.get("title", ""),
                 issue_body=issue.get("body", "") or "",
@@ -98,6 +98,7 @@ async def github_webhook(
         if "/jules run" in comment_body or "/openjules run" in comment_body:
             issue = payload.get("issue", {})
             task_payload = TaskPayload(
+                forge="github",
                 issue_id=issue.get("number"),
                 issue_title=issue.get("title", ""),
                 issue_body=issue.get("body", "") or "",
@@ -116,8 +117,56 @@ async def github_webhook(
         dispatcher.dispatch(task_payload)
         return {
             "status": "dispatched",
+            "forge": "github",
             "issue_id": task_payload.issue_id,
             "repo": task_payload.repo_full_name,
         }
 
     return {"status": "ignored", "reason": "No relevant OpenJules trigger in webhook payload"}
+
+
+class RadicleWebhookPayload(BaseModel):
+    """Payload model for Radicle event webhooks / proxy."""
+
+    event_type: str = Field(default="issue.created", description="Type of Radicle event")
+    rid: str = Field(description="Radicle Repository ID (e.g. rad:z4V1sJY...)")
+    issue_id: str | int = Field(description="Radicle issue ID or hash")
+    issue_title: str
+    issue_body: Optional[str] = ""
+    labels: list[str] = Field(default_factory=list)
+    default_branch: str = "master"
+
+
+@app.post("/api/radicle/webhook")
+async def radicle_webhook(
+    event: RadicleWebhookPayload,
+    background_tasks: BackgroundTasks,
+):
+    """Webhook adapter for self-hosted or local Radicle node events."""
+    label_triggered = any("openjules" in str(l).lower() for l in event.labels) or event.event_type == "openjules:run"
+
+    clean_rid = event.rid if event.rid.startswith("rad:") else f"rad:{event.rid}"
+
+    if label_triggered or event.event_type in ("openjules:run", "issue.labeled"):
+        task_payload = TaskPayload(
+            forge="radicle",
+            issue_id=event.issue_id,
+            issue_title=event.issue_title,
+            issue_body=event.issue_body or "",
+            repo_full_name=clean_rid,
+            repo_clone_url=clean_rid,
+            default_branch=event.default_branch,
+        )
+        dispatcher = BackgroundTasksDispatcher(
+            background_tasks=background_tasks,
+            task_handler=executor.execute_task,
+        )
+        dispatcher.dispatch(task_payload)
+        return {
+            "status": "dispatched",
+            "forge": "radicle",
+            "rid": clean_rid,
+            "issue_id": event.issue_id,
+        }
+
+    return {"status": "ignored", "reason": "No openjules label in Radicle event"}

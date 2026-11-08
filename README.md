@@ -1,57 +1,63 @@
 # OpenJules — Autonomous Sandboxed Coding Agent Service
 
 OpenJules is an open-source, asynchronous, cloud-agnostic equivalent of Google Jules.
-The system receives tasks from GitHub issues and webhooks, boots an isolated container sandbox (Docker-in-Docker / DinD), clones the repository, executes an agentic tool loop (file edits, shell commands, test verifications), and pushes the verified diff back as a clean Pull Request.
+The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-peer repositories (`rad:<rid>`)**, boots an isolated container sandbox (Docker-in-Docker / DinD), executes an agentic tool loop (file edits, shell commands, test verifications), and pushes the verified diff back as a **GitHub Pull Request** or **Radicle Patch**.
 
 ---
 
 ## Architecture Overview
 
 ```
-                      GitHub Webhook (Issue created/labeled /jules run)
-                                            │
-                                            ▼
-                               ┌─────────────────────────┐
-                               │     OpenJules API       │
-                               │  (FastAPI Control Plane)│
-                               └────────────┬────────────┘
-                                            │
-                                            ▼
-                               ┌─────────────────────────┐
-                               │   Background Worker     │
-                               │    (Task Dispatcher)    │
-                               └────────────┬────────────┘
-                                            │
-                                            ▼
-                               ┌─────────────────────────┐
-                               │     Sandbox Manager     │
-                               │   (Docker-py Runtime)   │
-                               └────────────┬────────────┘
-                                            │
-                     ┌──────────────────────┴──────────────────────┐
-                     ▼                                             ▼
-        ┌─────────────────────────┐                   ┌─────────────────────────┐
-        │   Isolated DinD Daemon  │                   │    Two-Stage Engine     │
-        │    (Docker Container)   │                   │  (LiteLLM / ReAct Loop) │
-        └─────────────────────────┘                   └─────────────────────────┘
+          GitHub Webhook                                Radicle Node / Webhook
+   (issue labeled openjules:run)                     (issue labeled openjules:run)
+                 │                                                 │
+                 ▼                                                 ▼
+        ┌──────────────────────────────────────────────────────────────────┐
+        │                 OpenJules API (FastAPI Control Plane)            │
+        │          /api/webhook (GitHub)   |   /api/radicle/webhook        │
+        └─────────────────────────────────┬────────────────────────────────┘
+                                          │
+                                          ▼
+        ┌──────────────────────────────────────────────────────────────────┐
+        │            Pluggable Task Dispatcher & Worker                    │
+        │      (BackgroundTasksDispatcher / RadicleNodePoller)             │
+        └─────────────────────────────────┬────────────────────────────────┘
+                                          │
+                                          ▼
+        ┌──────────────────────────────────────────────────────────────────┐
+        │                     Sandbox Manager (Docker-py)                  │
+        │           Mounts /workspace, sets 4G RAM & 2 CPU quota           │
+        └─────────────────────────────────┬────────────────────────────────┘
+                                          │
+                  ┌───────────────────────┴───────────────────────┐
+                  ▼                                               ▼
+     ┌─────────────────────────┐                     ┌─────────────────────────┐
+     │    Two-Stage Engine     │                     │   Pluggable Forge Layer │
+     │  Planning -> ReAct Loop │                     │   GitHubProvider        │
+     │  -> Verification Loop   │                     │   RadicleProvider       │
+     └─────────────────────────┘                     └─────────────────────────┘
 ```
 
-The system comprises 4 distinct phases:
+The system comprises 4 core architectural phases plus pluggable multi-forge support:
 1. **Repository Configuration & Sandbox Runtime (`src/sandbox/`)**:
    - `src/sandbox/config.py`: Schema parser for `.openjules.yaml` defining base image, setup scripts, test commands, timeouts, and env vars.
    - `src/sandbox/docker_driver.py`: `SandboxManager` handling container spawning with resource limits (`mem_limit="4g"`, `nano_cpus=2000000000`), workspace mounting, credential injection, command streaming, and strict `try...finally` cleanup.
 2. **Agent Tools & Two-Stage Engine (`src/agent/`)**:
-   - `src/agent/tools.py`: Minimal, robust tools executing directly inside the sandbox: `read_file`, `write_file`, `apply_patch`, `run_command`, `list_files`.
+   - `src/agent/tools.py`: Safe tools executing directly inside the sandbox: `read_file`, `write_file`, `apply_patch` (unified diff + search/replace block support), `run_command`, `list_files`.
    - `src/agent/engine.py`:
      - **Step A (Planning Phase)**: Generates structured JSON plan (`rationale`, `target_files`, `planned_tests`, `action_steps`).
-     - **Step B (Action Loop)**: Stateful ReAct loop with max turn limits.
+     - **Step B (Action Loop)**: Stateful ReAct loop with turn limit.
      - **Step C (Verification)**: Automatically executes `config.test_command` with an iterative fix loop if tests fail.
-3. **Git Lifecycle & Branch Management (`src/git_manager/`)**:
-   - `src/git_manager/lifecycle.py`: Task branch generation (`openjules/task-{issue_id}-{slug}`), Conventional Commits, diff calculation (`git diff main...HEAD`), and automated PR summary formatting.
-4. **Control Plane & GitHub Webhook Bot (`src/api/` & `src/worker/`)**:
-   - `src/api/webhook.py`: FastAPI endpoint verifying HMAC-SHA256 signatures, listening for `issues.labeled` (`openjules:run`) or issue comments (`/jules run`).
-   - `src/worker/dispatcher.py`: Extensible `TaskDispatcher` interface with FastAPI `BackgroundTasksDispatcher` default implementation.
-   - `src/worker/executor.py`: End-to-end task runner opening PRs (`Fixes #{issue_id}`) and posting status comments to GitHub issues.
+3. **Pluggable Forge Layer (`src/forge/` & `src/git_manager/`)**:
+   - `src/forge/base.py`: Abstract `ForgeProvider` interface for multi-forge extensibility.
+   - `src/forge/github.py`: GitHub App and PAT integration via PyGithub.
+   - `src/forge/radicle.py`: Radicle integration supporting the `rad` CLI (`rad clone`, `rad patch open`) and Radicle Node HTTP API.
+   - `src/git_manager/lifecycle.py`: Task branch management (`openjules/task-{issue_id}-{slug}`), Conventional Commits, diff calculation, and PR/Patch summary generation.
+4. **Control Plane & Background Task Workers (`src/api/` & `src/worker/`)**:
+   - `src/api/webhook.py`: FastAPI endpoints for GitHub HMAC-SHA256 webhooks and Radicle webhook events.
+   - `src/worker/dispatcher.py`: Extensible `TaskDispatcher` interface.
+   - `src/worker/radicle_poller.py`: Background poller for local or self-hosted Radicle nodes (`rad:<rid>`).
+   - `src/worker/executor.py`: End-to-end task runner opening PRs/Patches and posting status comments.
 
 ---
 
@@ -60,7 +66,8 @@ The system comprises 4 distinct phases:
 ### Prerequisites
 - Python 3.11+
 - Docker & Docker Compose
-- GitHub App or Personal Access Token with repository permissions
+- GitHub App or Personal Access Token (for GitHub)
+- Radicle node / CLI (for decentralized Radicle collaboration)
 - OpenAI, Anthropic, or Gemini API key
 
 ### 1. Local Development Setup
@@ -77,19 +84,32 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-### 2. Running with Docker Compose (DinD)
-
-The included `docker-compose.yml` runs OpenJules alongside an isolated Docker-in-Docker daemon:
+### 2. Running with Docker Compose (DinD + Optional Radicle Node)
 
 ```bash
+# Standard mode (GitHub + OpenJules DinD)
 docker compose up -d
+
+# Multi-forge mode with self-hosted Radicle Node
+docker compose --profile radicle up -d
 ```
 
 Check the health status:
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","service":"openjules"}
+# {"status":"ok","service":"openjules","forges":["github","radicle"]}
 ```
+
+---
+
+## Radicle Integration Guide (https://radicle.dev)
+
+OpenJules natively supports Radicle peer-to-peer code collaboration:
+- **Repository IDs (`rad:<rid>`)**: Clones and works on decentralized repos without a centralized server.
+- **Radicle Patches**: Changes are proposed via `rad patch open` rather than GitHub PRs.
+- **Dual Triggers**:
+  1. **Webhook / Proxy (`POST /api/radicle/webhook`)**: Triggered when a Radicle issue has the `openjules:run` label.
+  2. **Background Poller (`RadicleNodePoller`)**: Actively polls `GET /api/v1/projects/{rid}/issues` from your local node (`http://127.0.0.1:8080/api/v1`).
 
 ---
 
@@ -120,24 +140,6 @@ timeout_seconds: 900
 
 ---
 
-## GitHub App Configuration
-
-1. In GitHub Settings, create a **New GitHub App**.
-2. Set Webhook URL to: `https://your-openjules-host.com/api/webhook`
-3. Provide a **Webhook secret** and add it to `.env` as `GITHUB_WEBHOOK_SECRET`.
-4. Grant the following Repository Permissions:
-   - **Issues**: Read & Write (to receive webhook events and post progress comments)
-   - **Pull requests**: Read & Write (to create pull requests)
-   - **Contents**: Read & Write (to commit and push task branches)
-5. Subscribe to Webhook Events:
-   - `Issues`
-   - `Issue comment`
-6. Trigger OpenJules by either:
-   - Adding the label `openjules:run` to any issue.
-   - Leaving a comment with `/jules run` on any issue.
-
----
-
 ## Architecture Background & Philosophy
 
 ### The Harness vs. The Model
@@ -148,5 +150,6 @@ When agents fail on open-world software tasks, the root cause is rarely raw mode
 
 OpenJules embraces this philosophy by isolating the execution harness:
 - **Strict Sandbox Boundary**: Every task is constrained to an isolated container with deterministic resource limits (`4g` RAM, `2 CPUs`), ephemeral storage, and guaranteed `try...finally` teardown.
+- **Decentralized & Multi-Forge**: Pluggable forge layer decouples the agent core from any single centralized platform, natively powering both GitHub and Radicle p2p networks.
 - **Two-Stage Deliberation**: Separates architectural planning (Step A) from action execution (Step B) to prevent aimless code modifications.
 - **Closed-Loop Verification**: ReAct action loops are coupled to real environment test runners (Step C), creating an empirical feedback loop where code is only committed if test suites pass cleanly.

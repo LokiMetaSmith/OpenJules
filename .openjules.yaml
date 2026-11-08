@@ -3,10 +3,10 @@ image: "python:3.11-slim"
 
 # Commands executed inside the container to prepare the repository environment
 setup:
-  - pip install --no-cache-dir -r requirements.txt
+  - pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
   - pip install --no-cache-dir -e . 2>/dev/null || true
 
-# Test command used by OpenJules to verify changes before opening a PR
+# Test command used by OpenJules to verify changes before opening a PR / Patch
 test_command: "pytest"
 
 # Environment variables or secrets to inject into sandbox tasks
