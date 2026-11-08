@@ -10,6 +10,7 @@ from src.forge.base import ForgeProvider, ProposalResult
 from src.forge.github import GitHubProvider
 from src.forge.radicle import RadicleProvider
 from src.git_manager.lifecycle import GitLifecycleManager
+from src.polyphony.manager import PolyphonySwarmManager
 from src.sandbox.config import OpenJulesConfig, load_config_from_yaml
 from src.sandbox.docker_driver import SandboxManager
 from src.worker.dispatcher import TaskPayload
@@ -27,12 +28,14 @@ class TaskExecutor:
         git_manager: Optional[GitLifecycleManager] = None,
         github_client: Optional[Github] = None,
         radicle_provider: Optional[RadicleProvider] = None,
+        polyphony_manager: Optional[PolyphonySwarmManager] = None,
     ):
         self.sandbox_manager = sandbox_manager or SandboxManager()
         self.agent_engine = agent_engine or AgentEngine(self.sandbox_manager)
         self.git_manager = git_manager or GitLifecycleManager(self.sandbox_manager)
         self.github_provider = GitHubProvider(github_client=github_client)
         self.radicle_provider = radicle_provider or RadicleProvider(sandbox_manager=self.sandbox_manager)
+        self.polyphony_manager = polyphony_manager or PolyphonySwarmManager()
 
     def get_forge_provider(self, forge_type: str) -> ForgeProvider:
         """Retrieves provider for given forge type."""
@@ -63,6 +66,22 @@ class TaskExecutor:
         effective_token = git_token or os.environ.get("GITHUB_TOKEN")
         initial_config = OpenJulesConfig()
 
+        # Subscribe to repo-scoped Keystone Polyphony swarm
+        polyphony = self.polyphony_manager.get_or_create_client(payload.repo_full_name)
+        task_baton_key = f"task:{payload.issue_id}"
+
+        # Acquire task baton to prevent concurrent duplicate runs on the same issue
+        if not polyphony.acquire_baton(task_baton_key):
+            self.post_issue_comment(
+                forge,
+                payload.repo_full_name,
+                payload.issue_id,
+                f"⏸️ Task #{payload.issue_id} is already in progress by another agent in the Polyphony swarm. Aborting duplicate run.",
+            )
+            return False
+
+        polyphony.sync_task_backlog(payload.issue_id, payload.issue_title, status="in_progress")
+
         # Strict try...finally sandbox container & volume lifecycle
         try:
             with self.sandbox_manager.run_sandbox(
@@ -90,11 +109,13 @@ class TaskExecutor:
 
                 def on_progress(msg: str):
                     self.post_issue_comment(forge, payload.repo_full_name, payload.issue_id, msg)
+                    polyphony.share_thought(msg)
 
                 agent_result = self.agent_engine.run(
                     context=context,
                     task_instruction=task_instruction,
                     on_progress=on_progress,
+                    polyphony=polyphony,
                 )
 
                 if not agent_result.success:
@@ -104,6 +125,7 @@ class TaskExecutor:
                         payload.issue_id,
                         f"❌ Verification failed after {agent_result.turns_taken} turns. Automated tests did not pass cleanly.",
                     )
+                    polyphony.sync_task_backlog(payload.issue_id, payload.issue_title, status="failed")
                     return False
 
                 # 4. Commit changes
@@ -116,6 +138,7 @@ class TaskExecutor:
                         payload.issue_id,
                         "ℹ️ No file changes were detected to commit.",
                     )
+                    polyphony.sync_task_backlog(payload.issue_id, payload.issue_title, status="done")
                     return True
 
                 # 5. Push branch to remote / radicle storage
@@ -145,6 +168,7 @@ class TaskExecutor:
                 proposal_kind = "Patch" if forge == "radicle" else "Pull Request"
                 pr_msg = f"🎉 {proposal_kind} successfully opened: `{proposal.url_or_id}`"
                 self.post_issue_comment(forge, payload.repo_full_name, payload.issue_id, pr_msg)
+                polyphony.sync_task_backlog(payload.issue_id, payload.issue_title, status="done")
                 return True
 
         except Exception as e:
@@ -155,4 +179,9 @@ class TaskExecutor:
                 payload.issue_id,
                 f"⚠️ Fatal error during execution: `{str(e)}`",
             )
+            polyphony.sync_task_backlog(payload.issue_id, payload.issue_title, status="error")
             return False
+        finally:
+            # Guarantee strict baton release and swarm status reset on exit
+            polyphony.release_all_batons()
+            polyphony.set_status("idle")

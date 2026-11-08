@@ -14,5 +14,11 @@ env:
   PYTHONUNBUFFERED: "1"
   CI: "true"
 
+# Keystone Polyphony multi-agent coordination settings
+polyphony:
+  enabled: true
+  # Optional explicit swarm key override (defaults to deterministic repo hash)
+  swarm_key: null
+
 # Execution timeout in seconds
 timeout_seconds: 900
