@@ -1,7 +1,7 @@
 # OpenJules — Autonomous Sandboxed Coding Agent Service
 
 OpenJules is an open-source, asynchronous, cloud-agnostic equivalent of Google Jules.
-The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-peer repositories (`rad:<rid>`)**, boots an isolated container sandbox (Docker-in-Docker / DinD), coordinates concurrent agents working on the same repository via **Keystone Polyphony**, executes an agentic tool loop, and pushes the verified diff back as a **GitHub Pull Request** or **Radicle Patch**.
+The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-peer repositories (`rad:<rid>`)**, boots an isolated container sandbox (Docker-in-Docker / DinD), coordinates concurrent agents working on the same repository via **Keystone Polyphony**, executes an agentic tool loop with **cloud or self-hosted LLMs (vLLM, llama.cpp, Ollama)**, and pushes the verified diff back as a **GitHub Pull Request** or **Radicle Patch**.
 
 ---
 
@@ -40,19 +40,19 @@ The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-p
      ┌─────────────────────────┐                     ┌─────────────────────────┐
      │    Two-Stage Engine     │                     │   Pluggable Forge Layer │
      │  Planning -> ReAct Loop │                     │   GitHubProvider        │
-     │  -> Verification Loop   │                     │   RadicleProvider       │
+     │  (OpenAI / vLLM / llama)│                     │   RadicleProvider       │
      └─────────────────────────┘                     └─────────────────────────┘
 ```
 
-The system comprises 4 core architectural phases plus multi-forge and multi-agent swarm support:
+The system comprises 4 core architectural phases plus multi-forge, multi-agent swarm, and self-hosted model support:
 1. **Repository Configuration & Sandbox Runtime (`src/sandbox/`)**:
-   - `src/sandbox/config.py`: Schema parser for `.openjules.yaml` defining base image, setup scripts, test commands, timeouts, and env vars.
+   - `src/sandbox/config.py`: Schema parser for `.openjules.yaml` defining base image, setup scripts, test commands, timeouts, env vars, and per-repo LLM parameters.
    - `src/sandbox/docker_driver.py`: `SandboxManager` handling container spawning with resource limits (`mem_limit="4g"`, `nano_cpus=2000000000`), workspace mounting, credential injection, command streaming, and strict `try...finally` cleanup.
 2. **Agent Tools & Two-Stage Engine (`src/agent/`)**:
    - `src/agent/tools.py`: Safe tools executing directly inside the sandbox: `read_file`, `write_file`, `apply_patch` (unified diff + search/replace block support), `run_command`, `list_files`.
    - `src/agent/engine.py`:
      - **Step A (Planning Phase)**: Generates structured JSON plan (`rationale`, `target_files`, `planned_tests`, `action_steps`).
-     - **Step B (Action Loop)**: Stateful ReAct loop with turn limit.
+     - **Step B (Action Loop)**: Stateful ReAct loop with turn limit. Native OpenAI function calling with automatic prompt-guided JSON fallback for local LLMs lacking tool calling schemas.
      - **Step C (Verification)**: Automatically executes `config.test_command` with an iterative fix loop if tests fail.
 3. **Keystone Polyphony Multi-Agent Swarm (`src/polyphony/`)**:
    - Auto-subscribes all agents targeting the same repo to the repo's Polyphony choir using deterministic `SWARM_KEY` derivation (`keystone-polyphony-v1:<repo>`).
@@ -79,7 +79,7 @@ The system comprises 4 core architectural phases plus multi-forge and multi-agen
 - Docker & Docker Compose
 - GitHub App or Personal Access Token (for GitHub)
 - Radicle node / CLI (for decentralized Radicle collaboration)
-- OpenAI, Anthropic, or Gemini API key
+- LLM inference: OpenAI, Anthropic, Gemini, or a self-hosted server (**vLLM**, **llama.cpp**, **Ollama**)
 
 ### 1. Local Development Setup
 
@@ -95,17 +95,25 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-### 2. Running with Docker Compose (DinD + Optional Radicle Node + Polyphony MQTT)
+### 2. Running with Docker Compose
+
+OpenJules provides flexible compose profiles for all backends:
 
 ```bash
-# Standard mode (GitHub + OpenJules DinD)
+# 1. Standard mode (GitHub + OpenJules DinD + Cloud API keys)
 docker compose up -d
 
-# Multi-forge mode with self-hosted Radicle Node
+# 2. Multi-forge mode with self-hosted Radicle Node
 docker compose --profile radicle up -d
 
-# Swarm mode with Keystone Polyphony MQTT broker
+# 3. Swarm mode with Keystone Polyphony MQTT broker
 docker compose --profile swarm up -d
+
+# 4. Self-hosted inference with vLLM
+docker compose --profile vllm up -d
+
+# 5. Lightweight inference with llama.cpp server
+docker compose --profile llamacpp up -d
 ```
 
 Check health:
@@ -116,12 +124,53 @@ curl http://localhost:8000/health
 
 ---
 
+## Self-Hosted LLMs (vLLM, llama.cpp, Ollama)
+
+OpenJules natively connects to any OpenAI-compatible inference endpoint:
+
+### Configuration via Environment Variables
+
+```bash
+# Connect to vLLM
+export LLM_API_BASE="http://localhost:8001/v1"
+export LLM_MODEL="openai/Qwen/Qwen2.5-Coder-7B-Instruct"
+export LLM_API_KEY="EMPTY"
+
+# Connect to llama.cpp server
+export LLM_API_BASE="http://localhost:8081/v1"
+export LLM_MODEL="gpt-3.5-turbo" # Or any dummy model name
+export LLM_API_KEY="EMPTY"
+
+# Connect to Ollama
+export LLM_API_BASE="http://localhost:11434/v1"
+export LLM_MODEL="ollama/codellama"
+export LLM_API_KEY="ollama"
+```
+
+### Configuration via Repository (`.openjules.yaml`)
+
+Repositories can also specify custom models or endpoints directly:
+
+```yaml
+llm:
+  model: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  api_base: "http://vllm:8000/v1"
+  api_key: "EMPTY"
+  temperature: 0.2
+  max_tokens: 4096
+```
+
+### Tool Calling Compatibility
+Local LLM servers that do not yet support the OpenAI `tools` schema are handled transparently. If a server rejects the tool specification, OpenJules automatically falls back to prompt-guided JSON tool generation and extracts action blocks from response text.
+
+---
+
 ## Keystone Polyphony Integration (https://github.com/LokiMetaSmith/keystone-polyphony)
 
 Every agent operating on the same repository automatically joins that repository's Polyphony:
 - **Repo-Scoped Anchoring**: The `SWARM_KEY` is derived deterministically from the repository name or Radicle RID, partitioning coordination cleanly.
 - **Mutex Batons**: Agents acquire `task:{issue_id}` on startup and `file:{path}` during planning, preventing race conditions or conflicting code changes.
-- **Liminal Thoughts Stream**: Real-time progress thoughts ("Step A generated", "Running pytest", "Verification PASSED") stream into the shared mesh.
+- **Liminal Thoughts Stream**: Real-time progress thoughts stream into the shared mesh.
 
 ---
 
@@ -130,9 +179,7 @@ Every agent operating on the same repository automatically joins that repository
 OpenJules natively supports Radicle peer-to-peer code collaboration:
 - **Repository IDs (`rad:<rid>`)**: Clones and works on decentralized repos without a centralized server.
 - **Radicle Patches**: Changes are proposed via `rad patch open` rather than GitHub PRs.
-- **Dual Triggers**:
-  1. **Webhook / Proxy (`POST /api/radicle/webhook`)**: Triggered when a Radicle issue has the `openjules:run` label.
-  2. **Background Poller (`RadicleNodePoller`)**: Actively polls `GET /api/v1/projects/{rid}/issues` from your local node (`http://127.0.0.1:8080/api/v1`).
+- **Dual Triggers**: Webhooks (`POST /api/radicle/webhook`) and background polling (`RadicleNodePoller`).
 
 ---
 
@@ -157,10 +204,16 @@ env:
   PYTHONUNBUFFERED: "1"
   CI: "true"
 
+# LLM inference configuration
+llm:
+  model: "gpt-4o"
+  api_base: null
+  api_key: "EMPTY"
+
 # Keystone Polyphony coordination settings
 polyphony:
   enabled: true
-  swarm_key: null  # Optional override
+  swarm_key: null
 
 # Execution timeout in seconds
 timeout_seconds: 900
@@ -178,6 +231,7 @@ When agents fail on open-world software tasks, the root cause is rarely raw mode
 
 OpenJules embraces this philosophy by isolating the execution harness:
 - **Strict Sandbox Boundary**: Every task is constrained to an isolated container with deterministic resource limits (`4g` RAM, `2 CPUs`), ephemeral storage, and guaranteed `try...finally` teardown.
+- **Model Agnostic & Self-Hosted**: Seamlessly swaps between frontier cloud APIs and offline, self-hosted models (vLLM, llama.cpp, Ollama).
 - **Keystone Polyphony Swarm**: Coordinates multiple agents working asynchronously on the same repo using RTOS-inspired mutex batons and shared liminal context.
 - **Decentralized & Multi-Forge**: Pluggable forge layer decouples the agent core from any single centralized platform, natively powering both GitHub and Radicle p2p networks.
 - **Two-Stage Deliberation**: Separates architectural planning (Step A) from action execution (Step B) to prevent aimless code modifications.

@@ -18,6 +18,37 @@ services:
       timeout: 3s
       retries: 5
 
+  # Optional self-hosted vLLM inference server
+  vllm:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    environment:
+      - MODEL=${VLLM_MODEL:-Qwen/Qwen2.5-Coder-7B-Instruct}
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    networks:
+      - openjules-net
+    profiles:
+      - vllm
+
+  # Optional self-hosted llama.cpp server
+  llamacpp:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+    volumes:
+      - llamacpp-models:/models
+    networks:
+      - openjules-net
+    profiles:
+      - llamacpp
+
   # Optional MQTT broker for Keystone Polyphony macro transport
   polyphony-mqtt:
     image: eclipse-mosquitto:2
@@ -66,7 +97,11 @@ services:
       # Keystone Polyphony multi-agent coordination
       MQTT_HOST: ${MQTT_HOST:-polyphony-mqtt}
       MQTT_PORT: ${MQTT_PORT:-1883}
-      # Model API keys
+      # Self-hosted LLM settings (vLLM, llama.cpp, Ollama)
+      LLM_API_BASE: ${LLM_API_BASE:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      LLM_API_KEY: ${LLM_API_KEY:-EMPTY}
+      # Cloud Model API keys (optional fallback)
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
@@ -82,6 +117,8 @@ volumes:
   dind-data:
   workspace-data:
   radicle-data:
+  vllm-models:
+  llamacpp-models:
 
 networks:
   openjules-net:
