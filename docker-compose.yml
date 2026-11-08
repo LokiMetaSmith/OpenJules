@@ -1,0 +1,55 @@
+services:
+  dind:
+    image: docker:27-dind
+    privileged: true
+    restart: unless-stopped
+    environment:
+      # Disables TLS for internal container-to-container communication on default network
+      DOCKER_TLS_CERTDIR: ""
+    volumes:
+      # Persistent cache for sandboxed images and workspace layers
+      - dind-data:/var/lib/docker
+      - workspace-data:/workspace
+    networks:
+      - openjules-net
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  openjules:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      dind:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DOCKER_HOST: tcp://dind:2375
+      # GitHub App credentials
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-/secrets/github-app.pem}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Model API keys
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - ./src:/app/src:ro
+      - ./secrets:/secrets:ro
+      - workspace-data:/workspace
+    networks:
+      - openjules-net
+
+volumes:
+  dind-data:
+  workspace-data:
+
+networks:
+  openjules-net:
+    driver: bridge

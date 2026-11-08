@@ -1,249 +1,152 @@
-# jules
-A love letter to Jules
-Because Jules excels at unattended batch work with explicit specs and measurable targets, hand it a structured, multi-phase technical specification.
+# OpenJules — Autonomous Sandboxed Coding Agent Service
 
-Create a fresh GitHub repository (e.g., `open-jules`), configure a clean project skeleton, and hand Jules this exact markdown specification as an initial task or issue prompt.
-
----
-
-### Phase-by-Phase Prompt to Hand to Jules
-
-```markdown
-# Target: Implement "OpenJules" — Autonomous Sandboxed Coding Agent Service
-
-## Context & Objective
-We are building an open-source, asynchronous, cloud-agnostic equivalent of Google Jules.
-The system receives tasks from GitHub issues/webhooks, boots an isolated sandbox (Docker/container), clones the repository, executes an agentic tool loop (file edits, shell commands, test verifications), and pushes the verified diff back as a clean Pull Request.
-
-Build this service in Python (FastAPI + Docker SDK + LiteLLM/OpenAI format) with complete test coverage.
+OpenJules is an open-source, asynchronous, cloud-agnostic equivalent of Google Jules.
+The system receives tasks from GitHub issues and webhooks, boots an isolated container sandbox (Docker-in-Docker / DinD), clones the repository, executes an agentic tool loop (file edits, shell commands, test verifications), and pushes the verified diff back as a clean Pull Request.
 
 ---
 
-## Architecture & Core Deliverables
+## Architecture Overview
 
-### Phase 1: Repository Configuration & Sandbox Runtime (`src/sandbox/`)
-1. **Repository Config Parser (`src/sandbox/config.py`)**:
-   - Define a Pydantic schema for `.openjules.yaml`:
-     - `image`: string (default: `python:3.11-slim`)
-     - `setup`: list of shell commands to prepare environment (e.g., `pip install -e .`)
-     - `test_command`: shell command to verify the codebase (e.g., `pytest`)
-     - `env`: dict of environment variables or secret keys to inject
-     - `timeout_seconds`: integer (default: `900`)
-2. **Container Sandbox Engine (`src/sandbox/docker_driver.py`)**:
-   - Implement `SandboxManager` using `docker-py`.
-   - `spawn_sandbox(repo_url: str, branch: str, config: OpenJulesConfig, git_token: str) -> SandboxContext`:
-     - Provisions a container with resource constraints (`mem_limit="4g"`, `nano_cpus=2000000000`, network isolation options).
-     - Mounts a dedicated workspace directory (`/workspace`).
-     - Injects short-lived GitHub credentials via authenticated HTTPS remote URL.
-   - `exec_in_sandbox(container_id: str, cmd: str, timeout: int) -> ExecResult`:
-     - Runs commands with streaming `stdout`, `stderr`, and `exit_code`.
-   - `cleanup_sandbox(container_id: str)`:
-     - Guarantees complete container and volume teardown even on fatal task failures.
+```
+                      GitHub Webhook (Issue created/labeled /jules run)
+                                            │
+                                            ▼
+                               ┌─────────────────────────┐
+                               │     OpenJules API       │
+                               │  (FastAPI Control Plane)│
+                               └────────────┬────────────┘
+                                            │
+                                            ▼
+                               ┌─────────────────────────┐
+                               │   Background Worker     │
+                               │    (Task Dispatcher)    │
+                               └────────────┬────────────┘
+                                            │
+                                            ▼
+                               ┌─────────────────────────┐
+                               │     Sandbox Manager     │
+                               │   (Docker-py Runtime)   │
+                               └────────────┬────────────┘
+                                            │
+                     ┌──────────────────────┴──────────────────────┐
+                     ▼                                             ▼
+        ┌─────────────────────────┐                   ┌─────────────────────────┐
+        │   Isolated DinD Daemon  │                   │    Two-Stage Engine     │
+        │    (Docker Container)   │                   │  (LiteLLM / ReAct Loop) │
+        └─────────────────────────┘                   └─────────────────────────┘
+```
 
-### Phase 2: Agent Tools & Execution Loop (`src/agent/`)
-1. **Tool Definitions (`src/agent/tools.py`)**:
-   - Provide minimal, robust tools for the agent:
-     - `read_file(path: str, offset: int = 1, limit: int = 200)`
-     - `write_file(path: str, content: str)`
-     - `apply_patch(path: str, patch_str: str)`
-     - `run_command(command: str, timeout: int = 120)`
-     - `list_files(directory: str, max_depth: int = 3)`
-2. **Two-Stage Planner & Executor (`src/agent/engine.py`)**:
-   - **Step A (Planning Phase)**: Agent reads directory tree, README/context, and formulates a structured JSON plan (rationale, target files, planned test verification).
-   - **Step B (Action Loop)**: Stateful ReAct loop with max turn limits (default 25 turns):
-     - Executes tools inside the sandbox.
-     - Feeds compilation errors, test tracebacks, and linter errors back to the model context.
-   - **Step C (Verification)**: Automatically executes `config.test_command`. If exit code != 0, forces the agent back into a fix loop until green or turn limit reached.
-
-### Phase 3: Git Lifecycle & Branch Management (`src/git_manager/`)
-1. **Branch Workflow (`src/git_manager/lifecycle.py`)**:
-   - Creates task branch: `openjules/task-{issue_id}-{slug}`.
-   - Commits changes using Conventional Commits format (`fix: ...` or `feat: ...`).
-   - Pushes branch to origin using the GitHub App installation token.
-2. **Diff & Summary Generator**:
-   - Runs `git diff main...HEAD` inside the workspace.
-   - Summarizes changes and test outputs for the PR description.
-
-### Phase 4: Control Plane & GitHub Webhook Bot (`src/api/`)
-1. **GitHub App Webhook Handler (`src/api/webhook.py`)**:
-   - FastAPI route `/api/webhook` verifying GitHub HMAC-SHA256 signatures.
-   - Responds to `issues.labeled` (e.g., label: `openjules:run`) or issue comments containing `/jules run`.
-   - Extracts issue description and repo metadata.
-2. **Task Queue & Worker (`src/worker/`)**:
-   - Run background execution via FastAPI `BackgroundTasks` or simple Celery/Redis queue.
-   - Post progress comments directly on the GitHub Issue ("Plan generated", "Running tests...", "PR opened").
-   - Open a draft or finalized Pull Request referencing `Fixes #{issue_id}`.
+The system comprises 4 distinct phases:
+1. **Repository Configuration & Sandbox Runtime (`src/sandbox/`)**:
+   - `src/sandbox/config.py`: Schema parser for `.openjules.yaml` defining base image, setup scripts, test commands, timeouts, and env vars.
+   - `src/sandbox/docker_driver.py`: `SandboxManager` handling container spawning with resource limits (`mem_limit="4g"`, `nano_cpus=2000000000`), workspace mounting, credential injection, command streaming, and strict `try...finally` cleanup.
+2. **Agent Tools & Two-Stage Engine (`src/agent/`)**:
+   - `src/agent/tools.py`: Minimal, robust tools executing directly inside the sandbox: `read_file`, `write_file`, `apply_patch`, `run_command`, `list_files`.
+   - `src/agent/engine.py`:
+     - **Step A (Planning Phase)**: Generates structured JSON plan (`rationale`, `target_files`, `planned_tests`, `action_steps`).
+     - **Step B (Action Loop)**: Stateful ReAct loop with max turn limits.
+     - **Step C (Verification)**: Automatically executes `config.test_command` with an iterative fix loop if tests fail.
+3. **Git Lifecycle & Branch Management (`src/git_manager/`)**:
+   - `src/git_manager/lifecycle.py`: Task branch generation (`openjules/task-{issue_id}-{slug}`), Conventional Commits, diff calculation (`git diff main...HEAD`), and automated PR summary formatting.
+4. **Control Plane & GitHub Webhook Bot (`src/api/` & `src/worker/`)**:
+   - `src/api/webhook.py`: FastAPI endpoint verifying HMAC-SHA256 signatures, listening for `issues.labeled` (`openjules:run`) or issue comments (`/jules run`).
+   - `src/worker/dispatcher.py`: Extensible `TaskDispatcher` interface with FastAPI `BackgroundTasksDispatcher` default implementation.
+   - `src/worker/executor.py`: End-to-end task runner opening PRs (`Fixes #{issue_id}`) and posting status comments to GitHub issues.
 
 ---
 
-## Instructions for Execution
-1. Generate the modular project structure under `src/` and `tests/`.
-2. Include a `docker-compose.yml` and `Dockerfile` to run the OpenJules server locally.
-3. Write comprehensive unit and integration tests using `pytest` and `pytest-mock` (mocking Docker SDK and LLM API calls).
-4. Provide a sample `.openjules.yaml` and a `README.md` detailing quickstart instructions and GitHub App permission setup.
-5. Ensure `pytest` passes cleanly across all modules.
+## Quickstart
 
+### Prerequisites
+- Python 3.11+
+- Docker & Docker Compose
+- GitHub App or Personal Access Token with repository permissions
+- OpenAI, Anthropic, or Gemini API key
+
+### 1. Local Development Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/your-org/openjules.git
+cd openjules
+
+# Install dependencies
+pip install -r requirements-dev.txt
+
+# Run test suite
+pytest
+```
+
+### 2. Running with Docker Compose (DinD)
+
+The included `docker-compose.yml` runs OpenJules alongside an isolated Docker-in-Docker daemon:
+
+```bash
+docker compose up -d
+```
+
+Check the health status:
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","service":"openjules"}
 ```
 
 ---
 
-### How to Sequence This with Jules
+## Repository Configuration (`.openjules.yaml`)
 
-1. **Bootstrap the Repo**: Create the repository on GitHub with just an empty `README.md` and standard `.gitignore`.
-2. **Issue Submission**: Open Issue #1 titled `feat: Implement OpenJules core architecture` and paste the prompt above into the issue body.
-3. **Dispatch**: In the Jules dashboard or via `@jules`, assign the issue to Jules.
-4. **Plan Review**: Jules will read the repo, generate its multi-file implementation plan, and highlight the modules it plans to write (`src/sandbox`, `src/agent`, `src/git_manager`, `src/api`). Review and approve the plan.
-5. **PR Review**: When Jules finishes its test run inside its cloud sandbox, inspect the generated Pull Request diff and merge.
-
-Here is the setup for running the OpenJules orchestrator alongside an isolated Docker-in-Docker (DinD) daemon. This avoids mounting the host's `/var/run/docker.sock` directly into the orchestrator, containing ephemeral sandbox containers inside the DinD daemon.
-
-### `Dockerfile`
-
-```dockerfile
-FROM python:3.11-slim
-
-# Install system dependencies: git for repository management, curl for healthchecks
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Install Python dependencies first for caching layers
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application source
-COPY src/ ./src/
-
-ENV PYTHONUNBUFFERED=1
-ENV DOCKER_HOST=tcp://dind:2375
-
-EXPOSE 8000
-
-CMD ["uvicorn", "src.api.webhook:app", "--host", "0.0.0.0", "--port", "8000"]
-
-```
-
----
-
-### `requirements.txt`
-
-```text
-fastapi>=0.110.0
-uvicorn[standard]>=0.28.0
-docker>=7.0.0
-pydantic>=2.6.0
-pydantic-settings>=2.2.0
-PyGithub>=2.2.0
-litellm>=1.30.0
-httpx>=0.27.0
-
-```
-
----
-
-### `docker-compose.yml`
+Place `.openjules.yaml` in the root of your target repositories to customize runtime environments:
 
 ```yaml
-services:
-  dind:
-    image: docker:27-dind
-    privileged: true
-    restart: unless-stopped
-    environment:
-      # Disables TLS for internal container-to-container communication on default network
-      DOCKER_TLS_CERTDIR: ""
-    volumes:
-      # Persistent cache for sandboxed images and workspace layers
-      - dind-data:/var/lib/docker
-      - workspace-data:/workspace
-    networks:
-      - openjules-net
-    healthcheck:
-      test: ["CMD", "docker", "info"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
+# Base Docker image to spawn for the sandbox runtime
+image: "python:3.11-slim"
 
-  openjules:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    depends_on:
-      dind:
-        condition: service_healthy
-    ports:
-      - "8000:8000"
-    environment:
-      DOCKER_HOST: tcp://dind:2375
-      # GitHub App credentials
-      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
-      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-/secrets/github-app.pem}
-      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
-      # Model API keys
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-    volumes:
-      - ./src:/app/src:ro
-      - ./secrets:/secrets:ro
-      - workspace-data:/workspace
-    networks:
-      - openjules-net
+# Commands executed inside the container to prepare the repository environment
+setup:
+  - pip install --no-cache-dir -r requirements.txt
+  - pip install --no-cache-dir -e . 2>/dev/null || true
 
-volumes:
-  dind-data:
-  workspace-data:
+# Test command used by OpenJules to verify changes before opening a PR
+test_command: "pytest"
 
-networks:
-  openjules-net:
-    driver: bridge
+# Environment variables or secrets to inject into sandbox tasks
+env:
+  PYTHONUNBUFFERED: "1"
+  CI: "true"
 
+# Execution timeout in seconds
+timeout_seconds: 900
 ```
 
 ---
 
-### Operational Details
+## GitHub App Configuration
 
-* **Shared Volume (`workspace-data`):** Mounted into both containers at `/workspace`. When OpenJules spawns sandbox containers inside `dind`, it mounts subdirectories from `workspace-data` into the task containers so the host and agent share file access.
-* **Network Isolation:** Sandbox containers spun up inside `dind` communicate with the `dind` daemon on its own internal network namespace, preventing sandbox workloads from reaching the OpenJules API directly unless explicitly bridged.
-* **Volume Persistence:** `dind-data` persists downloaded base images (e.g., `python:3.11-slim`, `node:20`), avoiding repeated pulls for every inbound task.
-
-[`google-research/harness2`](https://github.com/google-research/harness2) is an open-source framework by Google Cloud AI Research for **recursive agent harnessing**.
-
-Rather than retraining or fine-tuning underlying model weights, Harness² focuses on automatically optimizing the **"harness"**—the scaffolding, prompts, tool definitions, memory, and orchestration layers wrapped around a frozen LLM.
-
----
-
-### Key Concepts
-
-* **The Harness vs. The Model:** In this paradigm, an agent consists of `Foundation Model + Harness`. When agents fail in open-world tasks, the failure is often not a limitation of raw model intelligence, but rather ambiguous system prompts, fragile tool schemas, unconstrained side effects, or lack of task-specific validation rules.
-* **Propose–Probe–Compose Loop:**
-1. **Propose:** The system generates alternative harness configurations (e.g., adding a validation guardrail, altering tool descriptions, or creating a domain-specific skill).
-2. **Probe:** The candidate harnesses execute the active task in parallel or sequential sandbox runs.
-3. **Compose:** By contrastively analyzing execution traces and behavioral differences (without needing ground-truth answers or labels), it composes an improved successor harness.
-
-
-* **8 Editable Harness Components:**
-* **Context / Persona:** System prompt, guardrails, memory, skills.
-* **Tool Interfaces:** Tool guidance, executable helper scripts.
-* **Execution:** Subagents (delegation), middleware plugins (tool-loop intercepts).
-
-
-* **Dual Recursion:**
-* *Task-Level Recursion:* Iteratively refines the harness for the current task.
-* *Harnessing-Level Recursion:* Persists accumulated learnings, skills, and guardrails across tasks into an improvement library (`EXPERIENCE.md`) so subsequent tasks start with compounded capabilities.
-
-
+1. In GitHub Settings, create a **New GitHub App**.
+2. Set Webhook URL to: `https://your-openjules-host.com/api/webhook`
+3. Provide a **Webhook secret** and add it to `.env` as `GITHUB_WEBHOOK_SECRET`.
+4. Grant the following Repository Permissions:
+   - **Issues**: Read & Write (to receive webhook events and post progress comments)
+   - **Pull requests**: Read & Write (to create pull requests)
+   - **Contents**: Read & Write (to commit and push task branches)
+5. Subscribe to Webhook Events:
+   - `Issues`
+   - `Issue comment`
+6. Trigger OpenJules by either:
+   - Adding the label `openjules:run` to any issue.
+   - Leaving a comment with `/jules run` on any issue.
 
 ---
 
-### Tech Stack & Requirements
+## Architecture Background & Philosophy
 
-* **Runtime:** Linux, Python 3.12+ (managed with `uv`).
-* **Executors / Benchmarks:** Supports executors like OpenCode and Codex, running evaluations against benchmarks like JobBench, LAB, and WorkBuddy-Bench.
-* **License:** Apache-2.0 (Google Research experiment, not an officially supported Google product).
+### The Harness vs. The Model
+In autonomous agent workflows, an agent can be understood as:
+$$\text{Agent} = \text{Foundation Model} + \text{Harness}$$
+
+When agents fail on open-world software tasks, the root cause is rarely raw model capability; rather, it stems from ambiguous system prompts, fragile tool schemas, unconstrained side effects, or lack of strict task-level verification loops.
+
+OpenJules embraces this philosophy by isolating the execution harness:
+- **Strict Sandbox Boundary**: Every task is constrained to an isolated container with deterministic resource limits (`4g` RAM, `2 CPUs`), ephemeral storage, and guaranteed `try...finally` teardown.
+- **Two-Stage Deliberation**: Separates architectural planning (Step A) from action execution (Step B) to prevent aimless code modifications.
+- **Closed-Loop Verification**: ReAct action loops are coupled to real environment test runners (Step C), creating an empirical feedback loop where code is only committed if test suites pass cleanly.

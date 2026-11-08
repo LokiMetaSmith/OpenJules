@@ -1,0 +1,18 @@
+# Base Docker image to spawn for the sandbox runtime
+image: "python:3.11-slim"
+
+# Commands executed inside the container to prepare the repository environment
+setup:
+  - pip install --no-cache-dir -r requirements.txt
+  - pip install --no-cache-dir -e . 2>/dev/null || true
+
+# Test command used by OpenJules to verify changes before opening a PR
+test_command: "pytest"
+
+# Environment variables or secrets to inject into sandbox tasks
+env:
+  PYTHONUNBUFFERED: "1"
+  CI: "true"
+
+# Execution timeout in seconds
+timeout_seconds: 900
