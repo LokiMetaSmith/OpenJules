@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import yaml
 from pydantic import BaseModel, Field
+from src.agent.llm_config import LLMConfig
 
 
 class OpenJulesConfig(BaseModel):
@@ -24,6 +25,10 @@ class OpenJulesConfig(BaseModel):
     env: Dict[str, str] = Field(
         default_factory=dict,
         description="Environment variables or secret keys to inject into the sandbox.",
+    )
+    llm: Optional[LLMConfig] = Field(
+        default=None,
+        description="Optional repository-level LLM configuration for local/self-hosted or cloud inference.",
     )
     timeout_seconds: int = Field(
         default=900,

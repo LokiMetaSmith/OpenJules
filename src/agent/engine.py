@@ -5,7 +5,9 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+import re
 import litellm
+from src.agent.llm_config import LLMConfig, resolve_llm_config
 from src.agent.tools import AgentTools, TOOL_DEFINITIONS
 from src.polyphony.client import PolyphonyClient
 from src.sandbox.config import OpenJulesConfig
@@ -46,25 +48,69 @@ class AgentEngine:
     def __init__(
         self,
         sandbox_manager: SandboxManager,
-        model_name: str = "gpt-4o",
+        model_name: Optional[str] = None,
         max_turns: int = 25,
         llm_client: Optional[Any] = None,
+        llm_config: Optional[LLMConfig] = None,
     ):
         self.sandbox_manager = sandbox_manager
-        self.model_name = model_name
         self.max_turns = max_turns
         self.llm_client = llm_client or litellm
+        self.llm_config = resolve_llm_config(llm_config)
+        if model_name:
+            self.llm_config.model = model_name
+        self.model_name = self.llm_config.model
 
-    def _call_llm(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Any:
-        """Invokes LLM with error handling and fallback."""
+    def _call_llm(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        active_config: Optional[LLMConfig] = None,
+    ) -> Any:
+        """Invokes LLM with OpenAI/vLLM/llama.cpp compatibility parameters."""
+        cfg = active_config or self.llm_config
         kwargs: Dict[str, Any] = {
-            "model": self.model_name,
+            "model": cfg.model,
             "messages": messages,
+            "temperature": cfg.temperature,
         }
+        if cfg.api_base:
+            kwargs["api_base"] = cfg.api_base
+        if cfg.api_key:
+            kwargs["api_key"] = cfg.api_key
+        if cfg.max_tokens:
+            kwargs["max_tokens"] = cfg.max_tokens
+
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        return self.llm_client.completion(**kwargs)
+
+        try:
+            return self.llm_client.completion(**kwargs)
+        except Exception as e:
+            # If server does not support tools schema (e.g. older llama.cpp server), retry without tools parameter
+            err_msg = str(e).lower()
+            if tools and ("tool" in err_msg or "schema" in err_msg or "not supported" in err_msg):
+                logger.warning(
+                    f"LLM server rejected tools parameter ({e}). Retrying with prompt-guided JSON mode..."
+                )
+                del kwargs["tools"]
+                if "tool_choice" in kwargs:
+                    del kwargs["tool_choice"]
+                # Append tool definition guide to system/user prompt
+                fallback_guide = (
+                    "\n\nTo call a tool, respond with a JSON codeblock format:\n"
+                    "```json\n{\"tool\": \"<tool_name>\", \"arguments\": {<args>}}\n```\n"
+                    "Or reply 'TASK_COMPLETED' if done."
+                )
+                augmented_messages = list(messages)
+                augmented_messages[-1] = {
+                    "role": augmented_messages[-1]["role"],
+                    "content": augmented_messages[-1]["content"] + fallback_guide,
+                }
+                kwargs["messages"] = augmented_messages
+                return self.llm_client.completion(**kwargs)
+            raise e
 
     def step_a_planning(
         self,
@@ -202,15 +248,45 @@ class AgentEngine:
                 ]
             messages.append(assistant_msg_dict)
 
-            # Check if finished
-            if not getattr(msg, "tool_calls", None):
-                if msg.content and "TASK_COMPLETED" in msg.content:
+            # Check if finished or fallback JSON tool call in content
+            content_text = msg.content or ""
+            tool_calls = getattr(msg, "tool_calls", None)
+
+            if not tool_calls:
+                if "TASK_COMPLETED" in content_text:
                     break
-                # If LLM didn't call tools and didn't say task completed, break or nudge
+
+                # Fallback: check if model generated a JSON tool call block in text
+                json_tool_match = re.search(r"```json\s*(\{.*?\})\s*```", content_text, re.DOTALL)
+                if not json_tool_match and content_text.strip().startswith("{") and content_text.strip().endswith("}"):
+                    json_tool_candidate = content_text.strip()
+                elif json_tool_match:
+                    json_tool_candidate = json_tool_match.group(1)
+                else:
+                    json_tool_candidate = None
+
+                if json_tool_candidate:
+                    try:
+                        parsed_tc = json.loads(json_tool_candidate)
+                        t_name = parsed_tc.get("tool") or parsed_tc.get("function") or parsed_tc.get("name")
+                        t_args = parsed_tc.get("arguments") or parsed_tc.get("args") or {}
+                        if t_name:
+                            tool_out = self.execute_tool(tools, t_name, t_args)
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": f"[Tool Output for {t_name}]:\n{tool_out}",
+                                }
+                            )
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Could not parse fallback json tool call: {e}")
+
+                # If no tool calls and no completion keyword, terminate turn loop
                 break
 
-            # Execute tool calls
-            for tc in msg.tool_calls:
+            # Execute standard tool calls
+            for tc in tool_calls:
                 func_name = tc.function.name
                 raw_args = tc.function.arguments
                 try:

@@ -14,11 +14,20 @@ env:
   PYTHONUNBUFFERED: "1"
   CI: "true"
 
+# LLM inference server configuration (self-hosted or cloud)
+llm:
+  # Model name (e.g. 'openai/Qwen/Qwen2.5-Coder-7B-Instruct' or 'gpt-4o')
+  model: "gpt-4o"
+  # Optional base URL for local servers (e.g. 'http://vllm:8000/v1' or 'http://llamacpp:8080/v1')
+  api_base: null
+  api_key: "EMPTY"
+  temperature: 0.2
+  max_tokens: 4096
+
 # Keystone Polyphony multi-agent coordination settings
 polyphony:
   enabled: true
-  # Optional explicit swarm key override (defaults to deterministic repo hash)
-  swarm_key: null
+  swarm_key: null  # Optional override
 
 # Execution timeout in seconds
 timeout_seconds: 900
