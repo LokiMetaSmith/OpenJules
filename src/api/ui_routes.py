@@ -67,7 +67,8 @@ def create_ui_task(
                 tasks_db[tid]["status"] = "completed" if success else "failed"
                 # Pull current thoughts
                 poly = executor.polyphony_manager.get_or_create_client(p.repo_full_name)
-                tasks_db[tid]["thoughts"] = poly.thought_stream
+                if poly.thought_stream:
+                    tasks_db[tid]["thoughts"] = poly.thought_stream
         except Exception as e:
             if tid in tasks_db:
                 tasks_db[tid]["status"] = "error"
