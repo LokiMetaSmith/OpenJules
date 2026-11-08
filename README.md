@@ -1,7 +1,7 @@
 # OpenJules — Autonomous Sandboxed Coding Agent Service
 
 OpenJules is an open-source, asynchronous, cloud-agnostic equivalent of Google Jules.
-The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-peer repositories (`rad:<rid>`)**, boots an isolated container sandbox (Docker-in-Docker / DinD), coordinates concurrent agents working on the same repository via **Keystone Polyphony**, executes an agentic tool loop with **cloud or self-hosted LLMs (vLLM, llama.cpp, Ollama)**, and pushes the verified diff back as a **GitHub Pull Request** or **Radicle Patch**.
+The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-peer repositories (`rad:<rid>`)**, boots an isolated container sandbox (Docker-in-Docker / DinD), coordinates concurrent agents working on the same repository via **Keystone Polyphony**, executes an **Adaptive Agent Harness (Propose–Probe–Compose loop)** with **cloud or self-hosted LLMs (vLLM, llama.cpp, Ollama)**, and pushes the verified diff back as a **GitHub Pull Request** or **Radicle Patch**.
 
 ---
 
@@ -38,22 +38,25 @@ The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-p
                   ┌───────────────────────┴───────────────────────┐
                   ▼                                               ▼
      ┌─────────────────────────┐                     ┌─────────────────────────┐
-     │    Two-Stage Engine     │                     │   Pluggable Forge Layer │
-     │  Planning -> ReAct Loop │                     │   GitHubProvider        │
-     │  (OpenAI / vLLM / llama)│                     │   RadicleProvider       │
+     │  Adaptive Agent Harness │                     │   Pluggable Forge Layer │
+     │  Propose-Probe-Compose  │                     │   GitHubProvider        │
+     │  EXPERIENCE.md Memory   │                     │   RadicleProvider       │
      └─────────────────────────┘                     └─────────────────────────┘
 ```
 
-The system comprises 4 core architectural phases plus multi-forge, multi-agent swarm, and self-hosted model support:
+The system comprises 4 core architectural phases plus multi-forge, multi-agent swarm, self-hosted LLM, and adaptive harness support:
 1. **Repository Configuration & Sandbox Runtime (`src/sandbox/`)**:
-   - `src/sandbox/config.py`: Schema parser for `.openjules.yaml` defining base image, setup scripts, test commands, timeouts, env vars, and per-repo LLM parameters.
+   - `src/sandbox/config.py`: Schema parser for `.openjules.yaml` defining base image, setup scripts, test commands, timeouts, env vars, LLM parameters, and adaptive harness settings.
    - `src/sandbox/docker_driver.py`: `SandboxManager` handling container spawning with resource limits (`mem_limit="4g"`, `nano_cpus=2000000000`), workspace mounting, credential injection, command streaming, and strict `try...finally` cleanup.
-2. **Agent Tools & Two-Stage Engine (`src/agent/`)**:
+2. **Adaptive Agent Harness & Two-Stage Engine (`src/harness/` & `src/agent/`)**:
+   - `src/harness/adaptive_engine.py`: Self-contained, adaptive harness implementing the **Propose–Probe–Compose** cycle.
+     - **Inner-Loop Adaptation (Task-Level)**: Proposes dynamic guardrails and diagnostic probe commands when verification tests fail, probing them in the sandbox before retrying fixes.
+     - **Outer-Loop Adaptation (Harnessing-Level)**: Distills lessons learned from successful runs into `EXPERIENCE.md`, compounding repository-specific rules across all future tasks.
    - `src/agent/tools.py`: Safe tools executing directly inside the sandbox: `read_file`, `write_file`, `apply_patch` (unified diff + search/replace block support), `run_command`, `list_files`.
    - `src/agent/engine.py`:
-     - **Step A (Planning Phase)**: Generates structured JSON plan (`rationale`, `target_files`, `planned_tests`, `action_steps`).
+     - **Step A (Planning Phase)**: Injects historical experience from `EXPERIENCE.md` and generates structured JSON plan (`rationale`, `target_files`, `planned_tests`, `action_steps`).
      - **Step B (Action Loop)**: Stateful ReAct loop with turn limit. Native OpenAI function calling with automatic prompt-guided JSON fallback for local LLMs lacking tool calling schemas.
-     - **Step C (Verification)**: Automatically executes `config.test_command` with an iterative fix loop if tests fail.
+     - **Step C (Verification)**: Automatically executes `config.test_command` with an adaptive fix loop if tests fail.
 3. **Keystone Polyphony Multi-Agent Swarm (`src/polyphony/`)**:
    - Auto-subscribes all agents targeting the same repo to the repo's Polyphony choir using deterministic `SWARM_KEY` derivation (`keystone-polyphony-v1:<repo>`).
    - **Baton Mutex Locks**: Prevents duplicate concurrent runs (`task:{issue_id}`) and coordinates file modifications (`file:{path}`).
@@ -124,6 +127,21 @@ curl http://localhost:8000/health
 
 ---
 
+## Adaptive Agent Harness (Harness² Paradigm)
+
+In autonomous agent workflows, an agent is:
+$$\text{Agent} = \text{Foundation Model} + \text{Harness}$$
+
+OpenJules keeps model weights frozen while dynamically optimizing the **Harness**:
+1. **Inner Loop (Task Adaptation)**:
+   - When a test verification fails, the harness analyzes the execution trace and generates targeted guardrails and probe commands (`propose_harness_adaptation`).
+   - The probe commands run inside the sandbox, and the empirical findings are fed back to guide the next fix attempt.
+2. **Outer Loop (Compounded Experience)**:
+   - On every verified task, successful architectural strategies and discovered guardrails are committed to `EXPERIENCE.md`.
+   - Subsequent tasks automatically read `EXPERIENCE.md` during Step A planning, starting with accumulated project context.
+
+---
+
 ## Self-Hosted LLMs (vLLM, llama.cpp, Ollama)
 
 OpenJules natively connects to any OpenAI-compatible inference endpoint:
@@ -138,7 +156,7 @@ export LLM_API_KEY="EMPTY"
 
 # Connect to llama.cpp server
 export LLM_API_BASE="http://localhost:8081/v1"
-export LLM_MODEL="gpt-3.5-turbo" # Or any dummy model name
+export LLM_MODEL="gpt-3.5-turbo"
 export LLM_API_KEY="EMPTY"
 
 # Connect to Ollama
@@ -149,8 +167,6 @@ export LLM_API_KEY="ollama"
 
 ### Configuration via Repository (`.openjules.yaml`)
 
-Repositories can also specify custom models or endpoints directly:
-
 ```yaml
 llm:
   model: "Qwen/Qwen2.5-Coder-7B-Instruct"
@@ -158,10 +174,12 @@ llm:
   api_key: "EMPTY"
   temperature: 0.2
   max_tokens: 4096
-```
 
-### Tool Calling Compatibility
-Local LLM servers that do not yet support the OpenAI `tools` schema are handled transparently. If a server rejects the tool specification, OpenJules automatically falls back to prompt-guided JSON tool generation and extracts action blocks from response text.
+harness:
+  adaptive: true
+  experience_path: "EXPERIENCE.md"
+  inject_experience: true
+```
 
 ---
 
@@ -183,56 +201,11 @@ OpenJules natively supports Radicle peer-to-peer code collaboration:
 
 ---
 
-## Repository Configuration (`.openjules.yaml`)
-
-Place `.openjules.yaml` in the root of your target repositories:
-
-```yaml
-# Base Docker image to spawn for the sandbox runtime
-image: "python:3.11-slim"
-
-# Commands executed inside the container to prepare the repository environment
-setup:
-  - pip install --no-cache-dir -r requirements.txt
-  - pip install --no-cache-dir -e . 2>/dev/null || true
-
-# Test command used by OpenJules to verify changes before opening a PR
-test_command: "pytest"
-
-# Environment variables or secrets to inject into sandbox tasks
-env:
-  PYTHONUNBUFFERED: "1"
-  CI: "true"
-
-# LLM inference configuration
-llm:
-  model: "gpt-4o"
-  api_base: null
-  api_key: "EMPTY"
-
-# Keystone Polyphony coordination settings
-polyphony:
-  enabled: true
-  swarm_key: null
-
-# Execution timeout in seconds
-timeout_seconds: 900
-```
-
----
-
 ## Architecture Background & Philosophy
 
-### The Harness vs. The Model
-In autonomous agent workflows, an agent can be understood as:
-$$\text{Agent} = \text{Foundation Model} + \text{Harness}$$
-
-When agents fail on open-world software tasks, the root cause is rarely raw model capability; rather, it stems from ambiguous system prompts, fragile tool schemas, unconstrained side effects, or lack of strict task-level verification loops.
-
-OpenJules embraces this philosophy by isolating the execution harness:
+OpenJules embraces the **frozen model + adaptive harness** philosophy:
 - **Strict Sandbox Boundary**: Every task is constrained to an isolated container with deterministic resource limits (`4g` RAM, `2 CPUs`), ephemeral storage, and guaranteed `try...finally` teardown.
+- **Adaptive Harnessing**: Dynamic guardrail generation and persistent `EXPERIENCE.md` library ensure continuous learning without retraining.
 - **Model Agnostic & Self-Hosted**: Seamlessly swaps between frontier cloud APIs and offline, self-hosted models (vLLM, llama.cpp, Ollama).
 - **Keystone Polyphony Swarm**: Coordinates multiple agents working asynchronously on the same repo using RTOS-inspired mutex batons and shared liminal context.
 - **Decentralized & Multi-Forge**: Pluggable forge layer decouples the agent core from any single centralized platform, natively powering both GitHub and Radicle p2p networks.
-- **Two-Stage Deliberation**: Separates architectural planning (Step A) from action execution (Step B) to prevent aimless code modifications.
-- **Closed-Loop Verification**: ReAct action loops are coupled to real environment test runners (Step C), creating an empirical feedback loop where code is only committed if test suites pass cleanly.

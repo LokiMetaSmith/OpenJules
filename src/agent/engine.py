@@ -9,6 +9,7 @@ import re
 import litellm
 from src.agent.llm_config import LLMConfig, resolve_llm_config
 from src.agent.tools import AgentTools, TOOL_DEFINITIONS
+from src.harness.adaptive_engine import AdaptiveHarness
 from src.polyphony.client import PolyphonyClient
 from src.sandbox.config import OpenJulesConfig
 from src.sandbox.docker_driver import SandboxContext, SandboxManager
@@ -52,11 +53,13 @@ class AgentEngine:
         max_turns: int = 25,
         llm_client: Optional[Any] = None,
         llm_config: Optional[LLMConfig] = None,
+        adaptive_harness: Optional[AdaptiveHarness] = None,
     ):
         self.sandbox_manager = sandbox_manager
         self.max_turns = max_turns
         self.llm_client = llm_client or litellm
         self.llm_config = resolve_llm_config(llm_config)
+        self.harness = adaptive_harness or AdaptiveHarness()
         if model_name:
             self.llm_config.model = model_name
         self.model_name = self.llm_config.model
@@ -137,8 +140,14 @@ class AgentEngine:
             f"Respond ONLY with valid JSON."
         )
 
+        # Inject accumulated experience and adaptive guardrails from the harness
+        harness_context = self.harness.get_system_prompt_extension(context.workspace_dir)
+        system_content = "You are a senior software architect planning a code change. Always return valid JSON."
+        if harness_context:
+            system_content += f"\n\n{harness_context}"
+
         messages = [
-            {"role": "system", "content": "You are a senior software architect planning a code change. Always return valid JSON."},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": planning_prompt},
         ]
 
@@ -215,8 +224,14 @@ class AgentEngine:
             f"Steps: {plan.action_steps}\n"
         )
 
+        # Inject accumulated experience and adaptive guardrails from the harness
+        harness_context = self.harness.get_system_prompt_extension(context.workspace_dir)
+        full_system_prompt = system_prompt
+        if harness_context:
+            full_system_prompt += f"\n\n{harness_context}"
+
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": full_system_prompt},
             {"role": "user", "content": f"Task: {task_instruction}\n\n{plan_summary}"},
         ]
 
@@ -310,10 +325,11 @@ class AgentEngine:
         self,
         context: SandboxContext,
         tools: AgentTools,
+        task_instruction: str = "",
         fix_attempts: int = 3,
         on_progress: Optional[Callable[[str], None]] = None,
     ) -> bool:
-        """Step C: Automatically execute config.test_command and loop fixes if failing."""
+        """Step C: Automatically execute config.test_command and adaptively loop fixes if failing."""
         test_cmd = context.config.test_command
         if not test_cmd:
             return True
@@ -330,11 +346,32 @@ class AgentEngine:
                 logger.warning(f"Verification failed on final attempt:\n{res.stdout}\n{res.stderr}")
                 return False
 
-            # If tests failed, feed failure back to model to fix
+            # Inner Loop Adaptation: Propose harness refinement
+            error_trace = f"{res.stdout}\n{res.stderr}".strip()
+            proposal = self.harness.propose_harness_adaptation(
+                llm_client=self.llm_client,
+                model_name=self.model_name,
+                task_instruction=task_instruction,
+                failing_command=test_cmd,
+                test_traceback=error_trace,
+            )
+
+            # Probe any suggested helper commands inside the sandbox
+            probe_results = []
+            for helper_cmd in proposal.suggested_helper_commands:
+                probe_res = self.sandbox_manager.exec_in_sandbox(context.container_id, helper_cmd)
+                probe_results.append(f"$ {helper_cmd}\n{probe_res.stdout or probe_res.stderr}")
+
+            probe_text = ("\n\nDiagnostic Probe Results:\n" + "\n".join(probe_results)) if probe_results else ""
+
+            # Feed failure, adapted guardrails, and diagnostic probes back to model
             feedback_prompt = (
                 f"The test verification command '{test_cmd}' failed with exit code {res.exit_code}.\n"
                 f"[STDOUT]:\n{res.stdout}\n"
                 f"[STDERR]:\n{res.stderr}\n\n"
+                f"Adaptive Strategy: {proposal.suggested_strategy}\n"
+                f"Active Guardrails: {proposal.targeted_guardrails}\n"
+                f"{probe_text}\n"
                 f"Analyze the traceback and fix the code using your tools."
             )
             messages = [
@@ -395,13 +432,31 @@ class AgentEngine:
             polyphony.set_status("verifying")
             polyphony.share_thought(f"Step C: Running verification command '{context.config.test_command}'...")
 
-        verified = self.step_c_verification(context, tools, on_progress=on_progress)
+        verified = self.step_c_verification(
+            context,
+            tools,
+            task_instruction=task_instruction,
+            on_progress=on_progress,
+        )
 
         if polyphony:
             polyphony.share_thought(
                 f"Step C verification {'PASSED' if verified else 'FAILED'} after {turns} turns."
             )
             polyphony.set_status("idle")
+
+        # Outer Loop Adaptation: On successful verification, distill learnings into EXPERIENCE.md
+        if verified and context.workspace_dir:
+            try:
+                self.harness.record_successful_run(
+                    workspace_dir=context.workspace_dir,
+                    task_title=task_instruction[:80],
+                    task_instruction=task_instruction,
+                    llm_client=self.llm_client,
+                    model_name=self.model_name,
+                )
+            except Exception as e:
+                logger.debug(f"Experience recording ignored: {e}")
 
         return AgentResult(
             success=verified,
