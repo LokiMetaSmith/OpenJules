@@ -7,12 +7,13 @@ from fastapi import BackgroundTasks
 
 
 class TaskPayload(BaseModel):
-    """Payload representing a task triggered by GitHub webhook."""
+    """Payload representing a task triggered by GitHub or Radicle."""
 
-    issue_id: int
+    forge: str = Field(default="github", description="Target forge: 'github' or 'radicle'")
+    issue_id: int | str
     issue_title: str
-    issue_body: str
-    repo_full_name: str
+    issue_body: str = ""
+    repo_full_name: str  # e.g., 'owner/repo' or 'rad:z4V1sJY...'
     repo_clone_url: str
     default_branch: str = "main"
     installation_id: Optional[int] = None

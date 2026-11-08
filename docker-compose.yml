@@ -18,6 +18,19 @@ services:
       timeout: 3s
       retries: 5
 
+  # Optional self-hosted Radicle Node service
+  radicle-node:
+    image: radicle/radicle-node:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - radicle-data:/root/.radicle
+    networks:
+      - openjules-net
+    profiles:
+      - radicle
+
   openjules:
     build:
       context: .
@@ -35,6 +48,9 @@ services:
       GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-/secrets/github-app.pem}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Radicle settings
+      RADICLE_NODE_URL: ${RADICLE_NODE_URL:-http://radicle-node:8080/api/v1}
+      RAD_PASSPHRASE: ${RAD_PASSPHRASE:-}
       # Model API keys
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -43,12 +59,14 @@ services:
       - ./src:/app/src:ro
       - ./secrets:/secrets:ro
       - workspace-data:/workspace
+      - radicle-data:/root/.radicle
     networks:
       - openjules-net
 
 volumes:
   dind-data:
   workspace-data:
+  radicle-data:
 
 networks:
   openjules-net:
