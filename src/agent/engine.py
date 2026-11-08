@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 import litellm
 from src.agent.tools import AgentTools, TOOL_DEFINITIONS
+from src.polyphony.client import PolyphonyClient
 from src.sandbox.config import OpenJulesConfig
 from src.sandbox.docker_driver import SandboxContext, SandboxManager
 
@@ -282,24 +283,49 @@ class AgentEngine:
         context: SandboxContext,
         task_instruction: str,
         on_progress: Optional[Callable[[str], None]] = None,
+        polyphony: Optional[PolyphonyClient] = None,
     ) -> AgentResult:
-        """Executes full Step A -> Step B -> Step C workflow."""
+        """Executes full Step A -> Step B -> Step C workflow with Polyphony coordination."""
         tools = AgentTools(self.sandbox_manager, context.container_id)
 
         # Step A: Planning
         if on_progress:
             on_progress("Step A: Formulating plan...")
+        if polyphony:
+            polyphony.set_status("planning")
+            polyphony.share_thought("Step A: Formulating plan for repository...")
+
         plan = self.step_a_planning(context, task_instruction, tools)
+
+        if polyphony:
+            polyphony.share_thought(f"Step A plan generated: {plan.rationale[:150]}")
+            # Acquire baton locks on planned target files if possible
+            for target_file in plan.target_files:
+                polyphony.acquire_baton(f"file:{target_file}")
 
         # Step B: ReAct action loop
         if on_progress:
             on_progress("Step B: Executing action loop...")
+        if polyphony:
+            polyphony.set_status("busy")
+            polyphony.share_thought("Step B: Executing ReAct loop edits inside sandbox...")
+
         turns = self.step_b_action_loop(context, task_instruction, plan, tools, on_progress)
 
         # Step C: Verification
         if on_progress:
             on_progress("Step C: Verifying test suite...")
+        if polyphony:
+            polyphony.set_status("verifying")
+            polyphony.share_thought(f"Step C: Running verification command '{context.config.test_command}'...")
+
         verified = self.step_c_verification(context, tools, on_progress=on_progress)
+
+        if polyphony:
+            polyphony.share_thought(
+                f"Step C verification {'PASSED' if verified else 'FAILED'} after {turns} turns."
+            )
+            polyphony.set_status("idle")
 
         return AgentResult(
             success=verified,

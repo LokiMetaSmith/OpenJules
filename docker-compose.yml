@@ -18,6 +18,18 @@ services:
       timeout: 3s
       retries: 5
 
+  # Optional MQTT broker for Keystone Polyphony macro transport
+  polyphony-mqtt:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    networks:
+      - openjules-net
+    profiles:
+      - polyphony
+      - swarm
+
   # Optional self-hosted Radicle Node service
   radicle-node:
     image: radicle/radicle-node:latest
@@ -51,6 +63,9 @@ services:
       # Radicle settings
       RADICLE_NODE_URL: ${RADICLE_NODE_URL:-http://radicle-node:8080/api/v1}
       RAD_PASSPHRASE: ${RAD_PASSPHRASE:-}
+      # Keystone Polyphony multi-agent coordination
+      MQTT_HOST: ${MQTT_HOST:-polyphony-mqtt}
+      MQTT_PORT: ${MQTT_PORT:-1883}
       # Model API keys
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
