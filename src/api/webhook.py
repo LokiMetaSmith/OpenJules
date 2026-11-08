@@ -5,23 +5,44 @@ import hmac
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from src.api.ui_routes import record_ui_task, ui_router
 from src.worker.dispatcher import BackgroundTasksDispatcher, TaskDispatcher, TaskPayload
 from src.worker.executor import TaskExecutor
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="OpenJules Control Plane",
-    description="Autonomous Sandboxed Coding Agent Service API for GitHub and Radicle",
-    version="0.2.0",
+    title="OpenJules Control Plane & Dashboard",
+    description="Autonomous Sandboxed Coding Agent Service API & 3-Pane UI for GitHub and Radicle",
+    version="0.3.0",
 )
 
 executor = TaskExecutor()
+
+# Include dashboard and UI endpoints
+app.include_router(ui_router)
+
+# Mount static files
+static_dir = Path(__file__).parent.parent / "ui" / "static"
+if static_dir.is_dir():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+@app.get("/")
+def serve_dashboard():
+    """Serves the intuitive 3-pane web interface."""
+    index_file = static_dir / "index.html"
+    if index_file.is_file():
+        return FileResponse(str(index_file))
+    return {"message": "OpenJules Dashboard"}
 
 
 def verify_github_signature(payload_body: bytes, signature_header: Optional[str], secret: str) -> bool:

@@ -118,11 +118,11 @@ class PolyphonyClient:
         self.share_thought(f"Backlog task #{tid} status -> {status}")
         return task_entry
 
-    def release_all_batons(self) -> List[str]:
-        """Releases all batons currently held by this node (cleanup on task completion)."""
+    def release_all_batons(self, force: bool = False) -> List[str]:
+        """Releases batons held by this node (or all batons if force=True)."""
         released = []
         for resource, owner in list(self.batons.items()):
-            if owner == self.node_id:
+            if owner == self.node_id or force:
                 del self.batons[resource]
                 released.append(resource)
         if released:
