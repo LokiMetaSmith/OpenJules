@@ -5,6 +5,7 @@ import os
 from typing import Any, Optional
 from github import Github, Auth
 
+from src.agent.clarification import TaskClarificationDetector
 from src.agent.engine import AgentEngine
 from src.forge.base import ForgeProvider, ProposalResult
 from src.forge.github import GitHubProvider
@@ -37,6 +38,10 @@ class TaskExecutor:
         self.github_provider = GitHubProvider(github_client=github_client)
         self.radicle_provider = radicle_provider or RadicleProvider(sandbox_manager=self.sandbox_manager)
         self.polyphony_manager = polyphony_manager or PolyphonySwarmManager()
+        self.clarification_detector = TaskClarificationDetector(
+            llm_client=getattr(self.agent_engine, "llm_client", None),
+            model_name=getattr(self.agent_engine, "model_name", "gpt-4o"),
+        )
 
     def get_forge_provider(self, forge_type: str) -> ForgeProvider:
         """Retrieves provider for given forge type."""
@@ -93,6 +98,27 @@ class TaskExecutor:
             return False
 
         polyphony.sync_task_backlog(payload.issue_id, payload.issue_title, status="in_progress")
+
+        # Deep Planning Mode: Check if task needs clarification before executing
+        clarification = self.clarification_detector.evaluate_task(
+            title=payload.issue_title,
+            description=payload.issue_body,
+        )
+        if clarification.is_ambiguous and clarification.questions:
+            q_bullets = "\n".join(f"- {q}" for q in clarification.questions)
+            self.post_issue_comment(
+                forge,
+                payload.repo_full_name,
+                payload.issue_id,
+                f"🤔 **[OpenJules Planning Clarification]**\n"
+                f"{clarification.rationale}\n\n"
+                f"Please clarify the following before execution proceeds:\n{q_bullets}",
+            )
+            # If completely empty body, pause execution awaiting user response
+            if not payload.issue_body.strip():
+                polyphony.release_all_batons()
+                polyphony.set_status("awaiting_input")
+                return True
 
         # Strict try...finally sandbox container & volume lifecycle
         try:

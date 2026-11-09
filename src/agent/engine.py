@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 import re
 import litellm
+from src.agent.agents_rules import AgentsRuleEngine
 from src.agent.linter import LinterGuardrail, LintResult
 from src.agent.llm_config import LLMConfig, resolve_llm_config
 from src.agent.tools import AgentTools, TOOL_DEFINITIONS
@@ -62,6 +63,7 @@ class AgentEngine:
         self.llm_config = resolve_llm_config(llm_config)
         self.harness = adaptive_harness or AdaptiveHarness()
         self.linter = LinterGuardrail(self.sandbox_manager)
+        self.rule_engine = AgentsRuleEngine()
         if model_name:
             self.llm_config.model = model_name
         self.model_name = self.llm_config.model
@@ -144,7 +146,11 @@ class AgentEngine:
 
         # Inject accumulated experience and adaptive guardrails from the harness
         harness_context = self.harness.get_system_prompt_extension(context.workspace_dir)
+        agents_rules_context = self.rule_engine.get_prompt_context(context.workspace_dir)
+
         system_content = "You are a senior software architect planning a code change. Always return valid JSON."
+        if agents_rules_context:
+            system_content += f"\n\n{agents_rules_context}"
         if harness_context:
             system_content += f"\n\n{harness_context}"
 
