@@ -17,6 +17,9 @@ from src.api.ui_routes import record_ui_task, ui_router
 from src.api.ws import ws_manager, ws_router
 from src.worker.dispatcher import BackgroundTasksDispatcher, TaskDispatcher, TaskPayload
 from src.worker.executor import TaskExecutor
+from src.worker.pr_reviewer import PRReviewHandler, ReviewComment
+
+pr_review_handler = PRReviewHandler()
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +117,35 @@ async def github_webhook(
                 sender=payload.get("sender", {}).get("login", ""),
             )
 
-    # Case 2: Issue comment containing "/jules run" or "/openjules run"
+    # Case 2: PR Review Comment on code diff
+    elif x_github_event in ("pull_request_review_comment", "pull_request_review") and action in ("created", "submitted"):
+        comment = payload.get("comment", {}) or payload.get("review", {})
+        comment_body = comment.get("body", "")
+        # Trigger if addressed to Jules or on openjules branches
+        pr_data = payload.get("pull_request", {})
+        head_branch = pr_data.get("head", {}).get("ref", "")
+
+        if "/jules" in comment_body or head_branch.startswith("openjules/"):
+            review_comment = ReviewComment(
+                id=comment.get("id", 0),
+                body=comment_body,
+                path=comment.get("path"),
+                line=comment.get("line"),
+                author=comment.get("user", {}).get("login", ""),
+            )
+            background_tasks.add_task(
+                pr_review_handler.address_review_feedback,
+                repo_clone_url=clone_url,
+                branch_name=head_branch,
+                comments=[review_comment],
+            )
+            return {
+                "status": "review_iteration_dispatched",
+                "branch": head_branch,
+                "comment_id": review_comment.id,
+            }
+
+    # Case 3: Issue comment containing "/jules run" or "/openjules run"
     elif x_github_event == "issue_comment" and action == "created":
         comment = payload.get("comment", {})
         comment_body = comment.get("body", "")

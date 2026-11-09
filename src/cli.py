@@ -12,6 +12,7 @@ import uvicorn
 
 from src.agent.engine import AgentEngine
 from src.polyphony.client import PolyphonyClient, derive_repo_swarm_key
+from src.mcp.server import OpenJulesMCPServer
 from src.sandbox.config import OpenJulesConfig, load_config_from_file
 from src.sandbox.docker_driver import SandboxManager
 from src.worker.dispatcher import TaskPayload
@@ -98,6 +99,9 @@ def main():
     poly_parser = subparsers.add_parser("polyphony", help="Inspect repository Polyphony swarm key and state")
     poly_parser.add_argument("repo", type=str, help="Repository identifier")
 
+    # Command: mcp
+    mcp_parser = subparsers.add_parser("mcp", help="Run OpenJules Model Context Protocol (MCP) server")
+
     args = parser.parse_args()
 
     if args.command == "run":
@@ -106,6 +110,9 @@ def main():
         serve_dashboard(args.host, args.port)
     elif args.command == "polyphony":
         inspect_polyphony(args.repo)
+    elif args.command == "mcp":
+        mcp = OpenJulesMCPServer()
+        print(f"OpenJules MCP Server active with {len(mcp.get_tool_list())} tools.")
     else:
         parser.print_help()
 

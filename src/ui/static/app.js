@@ -177,20 +177,89 @@ function renderThoughtStream(thoughts) {
 }
 
 function renderDiff(diffText) {
-  const diffEl = document.getElementById("diff-content");
+  const diffContainer = document.getElementById("diff-viewport");
   const statsEl = document.getElementById("diff-stats");
-  if (!diffEl) return;
+  if (!diffContainer) return;
 
   if (!diffText || diffText.trim() === "") {
-    diffEl.innerText = "# No working changes detected in workspace.";
+    diffContainer.innerHTML = '<pre class="diff-code" id="diff-content"><code class="language-diff"># No working changes detected in workspace.\n# When the agent edits files and executes tools, diffs appear here.</code></pre>';
     if (statsEl) statsEl.innerText = "+0 -0";
     return;
   }
 
-  diffEl.innerText = diffText;
   const added = (diffText.match(/^\+[^+]/gm) || []).length;
   const removed = (diffText.match(/^-[^-]/gm) || []).length;
   if (statsEl) statsEl.innerText = `+${added} -${removed}`;
+
+  // Multi-file split parser
+  const fileChunks = diffText.split(/^diff --git /m).filter(Boolean);
+  if (fileChunks.length === 0) {
+    diffContainer.innerHTML = `<pre class="diff-code"><code>${escapeHtml(diffText)}</code></pre>`;
+    return;
+  }
+
+  diffContainer.innerHTML = "";
+  fileChunks.forEach((chunk, idx) => {
+    const lines = chunk.split("\n");
+    const headerLine = lines[0] || "unknown file";
+    const fileName = headerLine.split(" ")[0].replace(/^a\//, "");
+
+    const fileCard = document.createElement("div");
+    fileCard.className = "diff-file-card";
+
+    const fileHeader = document.createElement("div");
+    fileHeader.className = "diff-file-header";
+    fileHeader.innerHTML = `<span>📄 <strong>${escapeHtml(fileName)}</strong></span><span class="file-action-hint">Click line to review</span>`;
+
+    const codeBlock = document.createElement("div");
+    codeBlock.className = "diff-code-table";
+
+    lines.slice(1).forEach((line, lineIdx) => {
+      const row = document.createElement("div");
+      let lineClass = "diff-line-normal";
+      if (line.startsWith("+")) lineClass = "diff-line-add";
+      else if (line.startsWith("-")) lineClass = "diff-line-del";
+      else if (line.startsWith("@@")) lineClass = "diff-line-meta";
+
+      row.className = `diff-line ${lineClass}`;
+      row.onclick = () => promptInlineComment(fileName, lineIdx + 1, line);
+
+      row.innerHTML = `<span class="line-num">${lineIdx + 1}</span><span class="line-text">${escapeHtml(line)}</span>`;
+      codeBlock.appendChild(row);
+    });
+
+    fileCard.appendChild(fileHeader);
+    fileCard.appendChild(codeBlock);
+    diffContainer.appendChild(fileCard);
+  });
+}
+
+function escapeHtml(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+async function promptInlineComment(fileName, lineNo, lineText) {
+  if (!currentTaskId) return;
+  const comment = prompt(`Add inline review comment on ${fileName}:${lineNo}\nCode: ${lineText.substring(0, 50)}...`);
+  if (!comment || !comment.trim()) return;
+
+  try {
+    const res = await fetch(`/api/tasks/${currentTaskId}/comments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        comment: comment,
+        file_path: fileName,
+        line_number: lineNo,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      appendThoughtCard(data.comment);
+    }
+  } catch (e) {
+    alert("Failed to submit comment: " + e.message);
+  }
 }
 
 async function fetchCurrentDiff() {

@@ -39,9 +39,11 @@ def test_flow_b_radicle_full_lifecycle_e2e(tmp_path):
 
     mock_sandbox.exec_in_sandbox.side_effect = fake_exec
 
-    # Mock LLM sequence
+    # Mock LLM sequence: clarification check, Step A planning, Step B action, Step C experience distillation
     mock_llm = MagicMock()
     mock_llm.completion.side_effect = [
+        # Clarification check
+        MagicMock(choices=[MagicMock(message=MagicMock(content='{"is_ambiguous": false, "rationale": "Clear"}'))]),
         # Planning
         MagicMock(choices=[MagicMock(message=MagicMock(content='{"rationale":"P2P sync","target_files":["node.py"],"planned_tests":["pytest"],"action_steps":["edit"]}'))]),
         # Action completed

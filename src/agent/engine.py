@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 
 import re
 import litellm
+from src.agent.agents_rules import AgentsRuleEngine
+from src.agent.linter import LinterGuardrail, LintResult
 from src.agent.llm_config import LLMConfig, resolve_llm_config
 from src.agent.tools import AgentTools, TOOL_DEFINITIONS
 from src.harness.adaptive_engine import AdaptiveHarness
@@ -60,6 +62,8 @@ class AgentEngine:
         self.llm_client = llm_client or litellm
         self.llm_config = resolve_llm_config(llm_config)
         self.harness = adaptive_harness or AdaptiveHarness()
+        self.linter = LinterGuardrail(self.sandbox_manager)
+        self.rule_engine = AgentsRuleEngine()
         if model_name:
             self.llm_config.model = model_name
         self.model_name = self.llm_config.model
@@ -142,7 +146,11 @@ class AgentEngine:
 
         # Inject accumulated experience and adaptive guardrails from the harness
         harness_context = self.harness.get_system_prompt_extension(context.workspace_dir)
+        agents_rules_context = self.rule_engine.get_prompt_context(context.workspace_dir)
+
         system_content = "You are a senior software architect planning a code change. Always return valid JSON."
+        if agents_rules_context:
+            system_content += f"\n\n{agents_rules_context}"
         if harness_context:
             system_content += f"\n\n{harness_context}"
 
@@ -424,6 +432,14 @@ class AgentEngine:
             polyphony.share_thought("Step B: Executing ReAct loop edits inside sandbox...")
 
         turns = self.step_b_action_loop(context, task_instruction, plan, tools, on_progress)
+
+        # Step C: Optional static analysis linter run before test suite
+        if context.config.lint_command:
+            if on_progress:
+                on_progress(f"Running linter guardrail: '{context.config.lint_command}'...")
+            lint_res = self.linter.run_linter(context.container_id, context.config.lint_command)
+            if not lint_res.passed and polyphony:
+                polyphony.share_thought(f"Linter detected issues ({len(lint_res.diagnostics)} diagnostics)")
 
         # Step C: Verification
         if on_progress:

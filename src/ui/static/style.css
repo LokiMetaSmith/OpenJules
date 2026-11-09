@@ -263,6 +263,76 @@ body {
   background-color: #0b0f15;
   padding: 12px;
   overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.diff-file-card {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background-color: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.diff-file-header {
+  background-color: var(--bg-tertiary);
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.file-action-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.diff-code-table {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.diff-line {
+  display: flex;
+  cursor: pointer;
+  padding: 1px 0;
+}
+
+.diff-line:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.line-num {
+  width: 40px;
+  text-align: right;
+  padding-right: 10px;
+  color: #64748b;
+  user-select: none;
+}
+
+.line-text {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diff-line-add {
+  background-color: rgba(52, 211, 153, 0.12);
+  color: #86efac;
+}
+
+.diff-line-del {
+  background-color: rgba(248, 113, 113, 0.12);
+  color: #fca5a5;
+}
+
+.diff-line-meta {
+  background-color: rgba(56, 189, 248, 0.08);
+  color: var(--accent-blue);
 }
 
 .diff-code {
