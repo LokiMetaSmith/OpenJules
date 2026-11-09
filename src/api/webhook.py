@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from src.api.ui_routes import record_ui_task, ui_router
+from src.api.ws import ws_manager, ws_router
 from src.worker.dispatcher import BackgroundTasksDispatcher, TaskDispatcher, TaskPayload
 from src.worker.executor import TaskExecutor
 
@@ -29,6 +30,7 @@ executor = TaskExecutor()
 
 # Include dashboard and UI endpoints
 app.include_router(ui_router)
+app.include_router(ws_router)
 
 # Mount static files
 static_dir = Path(__file__).parent.parent / "ui" / "static"
