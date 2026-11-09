@@ -8,9 +8,12 @@ from pydantic import BaseModel, Field
 import re
 import litellm
 from src.agent.agents_rules import AgentsRuleEngine
+from src.agent.ensemble import EnsembleEngine
 from src.agent.linter import LinterGuardrail, LintResult
 from src.agent.llm_config import LLMConfig, resolve_llm_config
 from src.agent.tools import AgentTools, TOOL_DEFINITIONS
+from src.agent.visual_verifier import VisualVerifier
+from src.git_manager.checkpoints import GitCheckpointManager
 from src.harness.adaptive_engine import AdaptiveHarness
 from src.polyphony.client import PolyphonyClient
 from src.sandbox.config import OpenJulesConfig
@@ -64,6 +67,9 @@ class AgentEngine:
         self.harness = adaptive_harness or AdaptiveHarness()
         self.linter = LinterGuardrail(self.sandbox_manager)
         self.rule_engine = AgentsRuleEngine()
+        self.checkpoints = GitCheckpointManager(self.sandbox_manager)
+        self.visual_verifier = VisualVerifier(self.sandbox_manager)
+        self.ensemble = EnsembleEngine(self.llm_client)
         if model_name:
             self.llm_config.model = model_name
         self.model_name = self.llm_config.model
