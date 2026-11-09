@@ -12,7 +12,10 @@ logger = logging.getLogger(__name__)
 
 ui_router = APIRouter()
 
-# In-memory store for task dashboard tracking
+from src.storage.sqlite_storage import SQLiteStorageProvider
+
+# Persistent store for task dashboard tracking
+storage_provider = SQLiteStorageProvider()
 tasks_db: Dict[str, Dict[str, Any]] = {}
 
 
@@ -20,10 +23,16 @@ class PaletteCommandRequest(BaseModel):
     command: str = Field(description="Action to execute: 'verify', 'commit', 'proposal', 'harness_refine'")
 
 
+class ReviewCommentRequest(BaseModel):
+    comment: str = Field(description="Operator feedback/guidance comment on a file or line")
+    file_path: Optional[str] = Field(default=None, description="Target file path")
+    line_number: Optional[int] = Field(default=None, description="Target line number")
+
+
 def record_ui_task(payload: TaskPayload) -> str:
-    """Registers task into dashboard state."""
+    """Registers task into dashboard state and persistent storage."""
     tid = f"{payload.forge}-{payload.issue_id}"
-    tasks_db[tid] = {
+    task_dict = {
         "id": tid,
         "forge": payload.forge,
         "issue_id": payload.issue_id,
@@ -41,12 +50,17 @@ def record_ui_task(payload: TaskPayload) -> str:
         "diff": "",
         "created_at": None,
     }
+    tasks_db[tid] = task_dict
+    storage_provider.save_task(tid, task_dict)
     return tid
 
 
 @ui_router.get("/api/tasks")
 def list_tasks():
     """Returns list of active and recent tasks for the left pane."""
+    stored = storage_provider.list_tasks()
+    if stored:
+        return {"tasks": stored}
     return {"tasks": list(tasks_db.values())}
 
 
@@ -81,9 +95,13 @@ def create_ui_task(
 @ui_router.get("/api/tasks/{task_id}")
 def get_task_details(task_id: str):
     """Returns details, thoughts, and diff for the middle and right panes."""
-    if task_id not in tasks_db:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return tasks_db[task_id]
+    if task_id in tasks_db:
+        return tasks_db[task_id]
+    stored = storage_provider.get_task(task_id)
+    if stored:
+        tasks_db[task_id] = stored
+        return stored
+    raise HTTPException(status_code=404, detail="Task not found")
 
 
 @ui_router.get("/api/tasks/{task_id}/diff")
@@ -92,6 +110,35 @@ def get_task_diff(task_id: str):
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"diff": tasks_db[task_id].get("diff", "")}
+
+
+@ui_router.post("/api/tasks/{task_id}/comments")
+def add_review_comment(task_id: str, req: ReviewCommentRequest):
+    """Adds a human review comment to the task thought stream for agent guidance."""
+    if task_id not in tasks_db:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = tasks_db[task_id]
+    location_str = f" [{req.file_path}:{req.line_number}]" if req.file_path and req.line_number else ""
+    thought_entry = {
+        "origin": "Human Reviewer",
+        "status": "guidance",
+        "content": f"Feedback{location_str}: {req.comment}",
+    }
+    task["thoughts"].append(thought_entry)
+
+    # Broadcast to WebSocket if active
+    from src.api.ws import ws_manager
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(ws_manager.broadcast(task_id, {"type": "thought", "thought": thought_entry}))
+    except Exception:
+        pass
+
+    storage_provider.save_task(task_id, task)
+    return {"status": "recorded", "comment": thought_entry}
 
 
 @ui_router.post("/api/tasks/{task_id}/command")

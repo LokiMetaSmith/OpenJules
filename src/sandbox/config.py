@@ -23,6 +23,10 @@ class OpenJulesConfig(BaseModel):
         default="pytest",
         description="Shell command to verify the codebase after agent edits.",
     )
+    lint_command: Optional[str] = Field(
+        default=None,
+        description="Optional shell command to run static analysis/linters before tests (e.g. 'ruff check .' or 'flake8').",
+    )
     env: Dict[str, str] = Field(
         default_factory=dict,
         description="Environment variables or secret keys to inject into the sandbox.",
