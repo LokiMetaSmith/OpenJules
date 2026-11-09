@@ -13,6 +13,7 @@ from src.git_manager.lifecycle import GitLifecycleManager
 from src.polyphony.manager import PolyphonySwarmManager
 from src.sandbox.config import OpenJulesConfig, load_config_from_yaml
 from src.sandbox.docker_driver import SandboxManager
+from src.worker.auth import get_app_installation_token
 from src.worker.dispatcher import TaskPayload
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,18 @@ class TaskExecutor:
             f"🚀 OpenJules received task ({forge}): **{payload.issue_title}**. Initializing sandbox...",
         )
 
+        # Mint token dynamically via GitHub App JWT if credentials are present
         effective_token = git_token or os.environ.get("GITHUB_TOKEN")
+        app_id = os.environ.get("GITHUB_APP_ID")
+        app_key_path = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
+
+        if not effective_token and app_id and app_key_path and payload.installation_id:
+            effective_token = get_app_installation_token(
+                app_id=app_id,
+                private_key_or_path=app_key_path,
+                installation_id=payload.installation_id,
+            )
+
         initial_config = OpenJulesConfig()
 
         # Subscribe to repo-scoped Keystone Polyphony swarm

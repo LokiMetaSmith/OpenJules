@@ -1,10 +1,48 @@
 let currentTaskId = null;
 let activeTasks = [];
+let activeWs = null;
 
 document.addEventListener("DOMContentLoaded", () => {
   pollState();
   setInterval(pollState, 3000);
 });
+
+function connectTaskWebSocket(taskId) {
+  if (activeWs) {
+    activeWs.close();
+    activeWs = null;
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${protocol}//${window.location.host}/ws/tasks/${taskId}`;
+  try {
+    activeWs = new WebSocket(wsUrl);
+    activeWs.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "thought") {
+          appendThoughtCard(msg.thought);
+        } else if (msg.type === "diff") {
+          renderDiff(msg.diff);
+        }
+      } catch (e) {
+        console.debug("WS parse error", e);
+      }
+    };
+  } catch (err) {
+    console.debug("WebSocket connection fallback to polling", err);
+  }
+}
+
+function appendThoughtCard(th) {
+  const container = document.getElementById("thought-stream");
+  if (!container) return;
+  const card = document.createElement("div");
+  card.className = "thought-card";
+  card.innerHTML = `<div class="thought-meta">${th.origin || "Agent"} [${th.status || "executing"}]</div><div class="thought-body">${th.content || ""}</div>`;
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
+}
 
 async function pollState() {
   try {
@@ -83,6 +121,7 @@ function renderPolyphony(data) {
 
 async function selectTask(taskId) {
   currentTaskId = taskId;
+  connectTaskWebSocket(taskId);
   document.querySelectorAll(".task-card").forEach((c) => c.classList.remove("active"));
 
   // Highlight active card
