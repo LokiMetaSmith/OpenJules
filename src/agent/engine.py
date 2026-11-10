@@ -8,9 +8,13 @@ from pydantic import BaseModel, Field
 import re
 import litellm
 from src.agent.agents_rules import AgentsRuleEngine
+from src.agent.ast_indexer import ASTSymbolIndexer
 from src.agent.ensemble import EnsembleEngine
 from src.agent.linter import LinterGuardrail, LintResult
 from src.agent.llm_config import LLMConfig, resolve_llm_config
+from src.agent.security_scanner import SecurityScanner
+from src.agent.tandem import TandemSubagentCoordinator
+from src.agent.tdd_synthesizer import TDDSynthesizer
 from src.agent.tools import AgentTools, TOOL_DEFINITIONS
 from src.agent.visual_verifier import VisualVerifier
 from src.git_manager.checkpoints import GitCheckpointManager
@@ -70,6 +74,9 @@ class AgentEngine:
         self.checkpoints = GitCheckpointManager(self.sandbox_manager)
         self.visual_verifier = VisualVerifier(self.sandbox_manager)
         self.ensemble = EnsembleEngine(self.llm_client)
+        self.security_scanner = SecurityScanner()
+        self.tdd_synthesizer = TDDSynthesizer(self.llm_client)
+        self.tandem = TandemSubagentCoordinator(self.llm_client)
         if model_name:
             self.llm_config.model = model_name
         self.model_name = self.llm_config.model
