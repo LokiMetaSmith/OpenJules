@@ -14,6 +14,8 @@ from src.git_manager.lifecycle import GitLifecycleManager
 from src.polyphony.manager import PolyphonySwarmManager
 from src.sandbox.config import OpenJulesConfig, load_config_from_yaml
 from src.sandbox.docker_driver import SandboxManager
+from src.sandbox.self_healing import EnvironmentSelfHealer
+from src.sandbox.test_bisection import TestBisectionManager
 from src.worker.auth import get_app_installation_token
 from src.worker.dispatcher import TaskPayload
 
@@ -42,6 +44,8 @@ class TaskExecutor:
             llm_client=getattr(self.agent_engine, "llm_client", None),
             model_name=getattr(self.agent_engine, "model_name", "gpt-4o"),
         )
+        self.self_healer = EnvironmentSelfHealer(self.sandbox_manager)
+        self.test_bisection = TestBisectionManager(self.sandbox_manager)
 
     def get_forge_provider(self, forge_type: str) -> ForgeProvider:
         """Retrieves provider for given forge type."""
