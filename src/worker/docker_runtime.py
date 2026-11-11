@@ -76,8 +76,12 @@ git=['git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false']
 result=1
 with open('/workspace/run/output.log','wb') as output:
     try:
-        subprocess.run(git+['-c','safe.directory=/source','clone','--no-checkout',
-            '--no-hardlinks','--no-local','/source','/workspace/run/repo'],
+        # Local transport starts a separate upload-pack process and removes
+        # the caller's command-scoped Git configuration. Trust only this fixed,
+        # sanitized read-only source in that process, never all repositories.
+        subprocess.run(git+['clone','--no-checkout','--no-hardlinks','--no-local',
+            '--upload-pack=git -c safe.directory=/source upload-pack',
+            '/source','/workspace/run/repo'],
             check=True,env=env,stdout=output,stderr=subprocess.STDOUT)
         subprocess.run(git+['checkout','--detach',request['base']],
             cwd='/workspace/run/repo',check=True,env=env,stdout=output,stderr=subprocess.STDOUT)
