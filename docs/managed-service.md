@@ -15,6 +15,22 @@ and Python environment because OpenJules and Polyphony both use a `src` package.
 The service listens only on loopback. Remote access requires a deliberately
 configured HTTPS reverse proxy and the existing scoped bearer authentication.
 
+The supported entry point mounts only the authenticated worker lifecycle API.
+Legacy GitHub/Radicle webhooks, PR-review event dispatch, dashboard task creation
+and palette commands return HTTP 404 on this service. It does not import or start
+the standalone legacy executor, poller or MCP server, or initialize an in-memory
+Polyphony facade. Package exports still load the facade's class definitions.
+The separate `openjules run`, `openjules serve` and `openjules mcp` commands remain
+legacy interfaces. They are not managed task ingress and must not be exposed as
+part of this installation. Converging or explicitly gating those standalone
+interfaces remains tracked in issues #2 and #3.
+
+Authority liveness is not managed readiness. Even when the configured authority
+returns HTTP 200 from `/health`, an absent or unsupported managed protocol makes
+`/api/workers/capabilities` report `managed_dispatch: false`; `/api/workers/ensure`
+returns HTTP 503 without reserving or launching a worker. A previous successful
+capability response does not permit later admission after capabilities change.
+
 ## Ownership
 
 ZPM owns repository enrollment and the desired number of workers. OpenJules owns
@@ -114,3 +130,20 @@ Durable archives, stopped containers and volumes are retained for recovery.
 There is no automatic garbage collection or per-volume disk quota. The trusted
 host's storage capacity remains an operational limit. Do not delete recovery
 evidence to make an unknown reservation appear terminated.
+
+## Admission qualification
+
+`tests/integration/test_managed_service_admission.py` exercises the actual managed
+app, dispatcher, canonical HTTP client, source snapshot and durable journals.
+A real loopback HTTP fixture stays health-positive while its managed endpoint
+is absent or advertises an incompatible protocol. The test verifies repeated
+admission rejection, fresh capability revalidation, disabled legacy HTTP routes
+and zero worker, execution or dispatch records. A fresh Python process also
+checks that app construction imports no legacy execution entry point and
+initializes neither its in-memory facade, Docker nor a model provider.
+
+Docker image/daemon preflight uses an explicit driver fixture. This is admission
+and service-composition evidence, not an actual Docker trial or a live authority,
+provider or forge outcome. The existing installed three-service trials remain
+the interoperability gate. The command-only profile used here configures no
+model broker or children.
