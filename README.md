@@ -23,6 +23,13 @@ worker, with distinct UIDs, shared model limits and verified child capture befor
 root release. Child expiry or cancellation retires the whole worker. Forge
 publication remains outside this managed service.
 
+An explicit child `outcome_protocol: initial-v1` profile can retain completed,
+declined, clarification-needed or failed self-reports for the original private
+instruction. The parent can read provisional reports, and final capture binds
+them to canonical child records for reconnect. This requires the paired
+Polyphony capability and the approved image; it adds no execution permission or
+second instruction round. See the [outcome contract](docs/managed-children.md#explicit-initial-instruction-outcomes).
+
 CI qualifies execution, recovery and the model transport against deterministic
 provider fixtures. A configured live provider and semantic task quality require
 their own qualification. The older webhook, in-memory collaboration and DinD

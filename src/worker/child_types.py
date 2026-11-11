@@ -79,6 +79,7 @@ class ChildPolicy:
     )
     verify_argv: tuple[str, ...] = ()
     max_result_bytes: int = 4_000_000
+    outcome_protocol: str | None = None
 
     def __post_init__(self):
         if type(self.max_children) is not int or not 1 <= self.max_children <= 64:
@@ -123,6 +124,13 @@ class ChildPolicy:
             or not 1024 <= self.max_result_bytes <= 4_000_000
         ):
             raise ValueError("invalid child result bound")
+        if self.outcome_protocol is not None and (
+            self.outcome_protocol != "initial-v1"
+            or self.command != type(self).__dataclass_fields__["command"].default
+        ):
+            raise ValueError(
+                "child outcome protocol requires the approved managed runner"
+            )
 
     @property
     def uids(self) -> range:
@@ -136,7 +144,10 @@ class ChildPolicy:
 
     @property
     def fingerprint(self) -> str:
-        return digest({"protocol": PROTOCOL, "watchdog_protocol": 1, **asdict(self)})
+        values = asdict(self)
+        if self.outcome_protocol is None:
+            values.pop("outcome_protocol")
+        return digest({"protocol": PROTOCOL, "watchdog_protocol": 1, **values})
 
     @property
     def canonical_policy(self) -> dict:
@@ -160,6 +171,13 @@ class ChildPolicy:
         if (
             response.get("child_grants") is not True
             or approved != self.canonical_policy
+            or (
+                self.outcome_protocol is not None
+                and (
+                    type(response.get("child_initial_outcome")) is not int
+                    or response["child_initial_outcome"] != 1
+                )
+            )
         ):
             raise AuthorityUnavailable(
                 "Canonical child policy does not match the approved runtime"

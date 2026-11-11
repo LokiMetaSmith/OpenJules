@@ -67,7 +67,8 @@ Use the trusted root wrapper for the profile's root command:
 ```
 
 The image must contain that wrapper, `child_tools.py`, and `managed_runner.py` at
-their approved image paths. `docker/Dockerfile.managed-agent` includes all three.
+their approved image paths. `docker/Dockerfile.managed-agent` includes these and
+the optional `child_outcome.py` companion.
 The root wrapper imports its companions from the trusted image, including when
 run with `python3 -I -S`; task checkout modules cannot replace them. Image IDs or
 digests, source commits and root command argv retain the existing immutable
@@ -138,6 +139,77 @@ stable hashes. The root must deliberately inspect and apply a patch in its own
 checkout. Reading a child patch does not prove it was composed, tested,
 independently reviewed or accepted.
 
+## Explicit initial instruction outcomes
+
+A new approved child profile may add `"outcome_protocol": "initial-v1"` to its
+policy. This requires the default trusted `managed_runner.py` command and an
+image built with `child_outcome.py`. Approve the new image and profile incarnation
+before enabling it. Custom command children and profiles that omit the setting
+keep their original command arguments and policy fingerprint. Unsupported
+explicit protocol values or commands are rejected. Canonical readiness also
+requires the integer capability `child_initial_outcome: 1`; health alone cannot
+enable the extension.
+
+An enabled child receives one additional terminal tool:
+
+```json
+{"name": "report_outcome", "arguments": {"outcome": "declined", "summary": "The requested approach conflicts with the repository constraints."}}
+```
+
+`outcome` is `completed`, `declined`, `needs_clarification`, or `failed`. The
+private summary is at most 8192 UTF-8 bytes and cannot contain NUL. The tool must
+be the only call in its assistant response and ends that child's loop. A mixed
+terminal/tool response performs none of those tool calls. The existing `finish`
+tool reports `completed` only in this explicitly enabled child profile. Root
+completion behavior is unchanged.
+
+A decline, clarification request, or reported failure preserves partial work
+and does not run the optional child verification command. For `completed`, the
+semantic report is retained before configured verification; its pass/fail result
+is captured separately. Completion is a child claim. It does not prove tests,
+composition, termination, task acceptance, independent review, or publication
+authority. A process that never sends a report remains explicitly `unreported`,
+even if its exit code is zero or its patch is empty.
+
+The host adds `--outcome-socket` with that child's fixed `outcome.sock` path.
+The separate socket checks the child UID with `SO_PEERCRED`; model requests keep
+their existing exact schema. Callback JSON supplies only schema version,
+request identity, outcome and summary. The host derives the child, parent,
+original requirement revision and instruction binding from its immutable grant.
+The initial logical work-turn identity is separate from inference reservations.
+No callback or callback retry consumes another model call or starts another exec.
+
+The host retains one immutable report slot in the existing child journal before
+acknowledging. An identical request returns the same report; another key or
+changed content conflicts. The image client freezes one request key, body and
+overall deadline. It may resend those exact evidence bytes after a lost reply,
+and cannot replace the report or renew that deadline. The acknowledgement means
+locally retained, with `final: false`, `canonical_committed: false` and
+`release_authorized: false`.
+
+`child_status` exposes the typed report to the bound parent under
+`initial_outcome`, also explicitly provisional. Service restoration preserves the
+same child UID, exec identity and report. Existing protected canonical child
+reads recover the committed `initial_outcome` and final artifact references
+after final capture. This is client reconnection to retained records, not
+automatic restart of a terminated root loop.
+
+The final child manifest contains an optional `work_outcome` object bound to the
+original grant and instruction digest. For enabled profiles it contains either
+the retained report or an explicit null report with source `unreported`. Report
+retention and final capture freezing serialize in the existing journal. If a
+report arrives while the archive is being read, freezing retries from the new
+report; after freezing, a first or changed report is refused. An already retained
+identical retry remains safe. The canonical service validates the extension
+before reserving its immutable capture slot and again before terminal release.
+
+The existing whole-worker fence still precedes final capture. A report cannot
+disarm a watchdog, extend a deadline, refund a budget, clear an execution
+reference or authorize follow-up work. Summaries remain in protected records;
+they are not automatically published to public conversation. This first slice
+supports only the original private instruction. A second instruction round
+requires a separately approved persistent session contract.
+
 ## Deadlines, cancellation and final capture
 
 **A child deadline or cancellation retires the entire worker, including the root
@@ -189,7 +261,8 @@ Real Unix-socket tests are mandatory and do not silently skip when sockets are
 blocked by the test environment:
 
 ```sh
-python -m pytest tests/unit/test_child_socket.py tests/unit/test_child_tools.py
+python -m pytest tests/unit/test_child_socket.py tests/unit/test_child_tools.py \
+  tests/unit/test_child_outcome_socket.py
 ```
 
 The Docker qualification runs two children under distinct UIDs, composes their
@@ -199,8 +272,17 @@ journal recovery after host listeners stop:
 
 ```sh
 OPENJULES_MANAGED_DOCKER_TESTS=1 \
-  python -m pytest tests/integration/test_managed_children_runtime.py
+  python -m pytest tests/integration/test_managed_children_runtime.py \
+    tests/integration/test_managed_child_outcomes_runtime.py
 ```
+
+The outcome qualification uses real child runners, actual kernel peer checks,
+one completed and one declined report, provisional parent reads, host service
+restoration, and final capture after explicit worker retirement. It verifies
+that root/sibling UIDs cannot report as another child and that report retries
+add no inference. Journal tests cover both report/capture interleavings and lost
+capture or terminal replies. A shared Unicode fixture checks canonical hashes
+against the paired Polyphony contract.
 
 These OpenJules tests use explicitly named canonical-authority and model
 fixtures. They do not establish real Polyphony service interoperability or live

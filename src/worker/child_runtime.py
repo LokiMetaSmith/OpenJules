@@ -227,6 +227,11 @@ class ChildRuntime:
                         "--max-turns",
                         str(grant["binding"]["max_turns"]),
                     ]
+                    if policy.outcome_protocol is not None:
+                        command += [
+                            "--outcome-socket",
+                            f"/run/openjules-model/children/{child_id}/outcome.sock",
+                        ]
                     if policy.verify_argv:
                         command += ["--verify-json", canonical(policy.verify_argv)]
                     journal.update(root.worker_id, child_id, phase="creating")
@@ -425,6 +430,13 @@ class ChildRuntime:
             "termination_method": "whole-container fence",
             "evidence_source": "guest-generated; not independent review or proof of composition",
         }
+        if policy.outcome_protocol is not None:
+            from .child_outcomes import work_outcome
+
+            report = (
+                json.loads(child["outcome_report"]) if child["outcome_report"] else None
+            )
+            manifest["work_outcome"] = work_outcome(grant["binding"], report)
         return {
             "patch": selected.get("patch", ""),
             "log": selected.get("log", ""),

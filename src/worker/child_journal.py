@@ -11,7 +11,7 @@ import sqlite3
 import stat
 
 from .child_types import ChildPolicy, RootContext, canonical, digest
-from .lifecycle import LifecycleConflict, WorkerSpec
+from .lifecycle import LifecycleConflict, RuntimeUnavailable, WorkerSpec
 
 
 class ChildJournal:
@@ -45,6 +45,9 @@ class ChildJournal:
                 "provisional TEXT NOT NULL DEFAULT '{}',capture TEXT,artifacts TEXT NOT NULL DEFAULT '{}',"
                 "UNIQUE(worker_id,ordinal),UNIQUE(worker_id,uid));"
             )
+            columns = {row[1] for row in db.execute("PRAGMA table_info(children)")}
+            if "outcome_report" not in columns:
+                db.execute("ALTER TABLE children ADD COLUMN outcome_report TEXT")
 
     @contextmanager
     def connection(self):
@@ -283,7 +286,6 @@ class ChildJournal:
             "exit_code",
             "revoked",
             "provisional",
-            "capture",
             "artifacts",
         }
         if not changes or not set(changes) <= allowed:
@@ -311,16 +313,67 @@ class ChildJournal:
                 raise LifecycleConflict("armed child deadline cannot be extended")
             if old["revoked"] and changes.get("revoked", 1) != 1:
                 raise LifecycleConflict("child revocation cannot be cleared")
-            if (
-                old["capture"] is not None
-                and changes.get("capture", old["capture"]) != old["capture"]
-            ):
-                raise LifecycleConflict("final child capture cannot change")
             db.execute(
                 "UPDATE children SET "
                 + ",".join(name + "=?" for name in changes)
                 + " WHERE worker_id=? AND child_id=?",
                 (*changes.values(), worker_id, child_id),
+            )
+
+    def retain_outcome(self, worker_id, child_id, request_key, outcome, summary):
+        from src.agent.child_outcome import report_value
+
+        report = report_value(request_key, outcome, summary)
+        encoded = canonical(report)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            child = db.execute(
+                "SELECT * FROM children WHERE worker_id=? AND child_id=?",
+                (worker_id, child_id),
+            ).fetchone()
+            if child is None or not child["exec_dispatched"]:
+                raise LifecycleConflict("child outcome lacks its dispatched execution")
+            if child["outcome_report"] is not None:
+                if child["outcome_report"] != encoded:
+                    raise LifecycleConflict(
+                        "child outcome slot already has different content"
+                    )
+                return json.loads(child["outcome_report"])
+            if child["capture"] is not None:
+                raise LifecycleConflict("final child capture is already frozen")
+            db.execute(
+                "UPDATE children SET outcome_report=? WHERE worker_id=? AND child_id=?",
+                (encoded, worker_id, child_id),
+            )
+        return report
+
+    def freeze_capture(self, worker_id, child_id, contents, state, *, expected_report):
+        """Freeze one capture against the report used while reading its archive.
+
+        Archive work stays outside the write transaction. A report arriving in
+        the meantime causes a retry from a fresh child snapshot. No acknowledged
+        report can be silently omitted from the immutable manifest.
+        """
+        encoded = canonical({"contents": contents, "state": state})
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            child = db.execute(
+                "SELECT * FROM children WHERE worker_id=? AND child_id=?",
+                (worker_id, child_id),
+            ).fetchone()
+            if child is None:
+                raise LifecycleConflict("child is not owned by this worker")
+            if child["capture"] is not None:
+                if child["capture"] != encoded:
+                    raise LifecycleConflict("final child capture cannot change")
+                return
+            if child["outcome_report"] != expected_report:
+                raise RuntimeUnavailable(
+                    "child report changed before capture freeze; retry"
+                )
+            db.execute(
+                "UPDATE children SET capture=?,phase='captured' WHERE worker_id=? AND child_id=?",
+                (encoded, worker_id, child_id),
             )
 
     def close_admission(self, worker_id: str, reason: str, *, retire=False):

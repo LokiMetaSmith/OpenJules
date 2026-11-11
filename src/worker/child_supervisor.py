@@ -15,6 +15,7 @@ import time
 from src.polyphony.child_client import ChildAuthorityClient, ChildRejected
 from src.polyphony.managed_client import AuthorityUnavailable
 from .child_journal import ChildJournal
+from .child_outcomes import work_outcome
 from .child_runtime import ChildRuntime
 from .child_types import (
     CHILD_ID,
@@ -330,11 +331,60 @@ class ChildSupervisor:
 
     def _status(self, child):
         binding = json.loads(child["grant_json"])["binding"]
-        return {
+        result = {
             "child_id": child["child_id"],
             "state": child["phase"],
             "deadline": binding["deadline"],
             "capabilities": binding["capabilities"],
+        }
+        root = self.journal.context(child["worker_id"])
+        if self.policy(root.spec).outcome_protocol is not None:
+            report = (
+                json.loads(child["outcome_report"]) if child["outcome_report"] else None
+            )
+            result.update(
+                final=False,
+                initial_outcome=work_outcome(binding, report)
+                | {
+                    "canonical_committed": False,
+                    "release_authorized": False,
+                },
+            )
+        return result
+
+    def report_outcome(self, worker_id, child_id, payload):
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema_version", "request_id", "outcome", "summary"}
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 1
+        ):
+            raise ChildDenied("invalid_request")
+        root = self.journal.context(worker_id)
+        if self.closed or self.policy(root.spec).outcome_protocol is None:
+            raise ChildDenied("not_authorized")
+        child = self.journal.child(worker_id, child_id)
+        try:
+            report = self.journal.retain_outcome(
+                worker_id,
+                child_id,
+                payload["request_id"],
+                payload["outcome"],
+                payload["summary"],
+            )
+        except (ValueError, UnicodeError):
+            raise ChildDenied("invalid_request") from None
+        outcome = work_outcome(json.loads(child["grant_json"])["binding"], report)
+        return {
+            "schema_version": 1,
+            "request_id": payload["request_id"],
+            "ok": True,
+            "child_id": child_id,
+            "work_turn_id": outcome["work_turn_id"],
+            "report": report,
+            "final": False,
+            "canonical_committed": False,
+            "release_authorized": False,
         }
 
     def handle(self, worker_id, payload):
@@ -566,14 +616,25 @@ class ChildSupervisor:
                         and time.monotonic() >= child["deadline"]
                         else "exited"
                     )
-                    self.journal.update(
+                    self.journal.freeze_capture(
                         worker_id,
                         child["child_id"],
-                        capture=canonical({"contents": contents, "state": state}),
-                        phase="captured",
+                        contents,
+                        state,
+                        expected_report=child["outcome_report"],
                     )
                     child = self.journal.child(worker_id, child["child_id"])
                 captured = json.loads(child["capture"])
+                expected_outcome = json.loads(captured["contents"]["manifest"]).get(
+                    "work_outcome"
+                )
+                if (
+                    self.policy(root.spec).outcome_protocol is not None
+                    and expected_outcome is None
+                ):
+                    raise RuntimeUnavailable(
+                        "enabled child outcome is missing from final capture"
+                    )
                 artifacts = json.loads(child["artifacts"])
                 for kind, content in captured["contents"].items():
                     expected = text_hash(content)
@@ -613,6 +674,21 @@ class ChildSupervisor:
                     artifacts=artifacts,
                 )
                 terminal = result.get("child", {})
+                outcome_matches = True
+                if expected_outcome is not None:
+                    try:
+                        outcome_matches = canonical(
+                            terminal.get("initial_outcome")
+                        ) == canonical(
+                            expected_outcome
+                            | {
+                                "artifacts": artifacts,
+                                "canonical_committed": True,
+                                "release_authorized": False,
+                            }
+                        )
+                    except (TypeError, ValueError):
+                        outcome_matches = False
                 if (
                     terminal.get("id") != child["child_id"]
                     or terminal.get("termination_confirmed") is not True
@@ -621,6 +697,7 @@ class ChildSupervisor:
                     or terminal.get("binding")
                     != json.loads(child["grant_json"])["binding"]
                     or terminal.get("state") != captured["state"]
+                    or not outcome_matches
                 ):
                     raise AuthorityUnavailable(
                         "canonical child terminal receipt is incomplete"
