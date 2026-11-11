@@ -17,8 +17,11 @@ An optional [coding agent and model broker](docs/managed-model-broker.md) connec
 that root execution to an explicitly configured provider. The broker retains
 provider credentials on the trusted host, binds requests to canonical permission
 and enforces shared call/token limits. Worker networking remains disabled.
-The default profile makes no model calls. Delegated child execution and forge
-publication remain unsupported by this managed service.
+The default profile makes no model calls. Explicitly approved profiles can use
+[one level of bounded child agents](docs/managed-children.md) inside the same
+worker, with distinct UIDs, shared model limits and verified child capture before
+root release. Child expiry or cancellation retires the whole worker. Forge
+publication remains outside this managed service.
 
 CI qualifies execution, recovery and the model transport against deterministic
 provider fixtures. A configured live provider and semantic task quality require

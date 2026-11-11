@@ -140,6 +140,7 @@ class ManagedDispatcher:
         poll_interval_seconds: float = 1,
         max_parallel: int = 16,
         model_broker=None,
+        child_supervisor=None,
     ):
         if (
             isinstance(poll_interval_seconds, bool)
@@ -158,6 +159,7 @@ class ManagedDispatcher:
         self.poll_interval_seconds = poll_interval_seconds
         self.max_parallel = max_parallel
         self.model_broker = model_broker
+        self.child_supervisor = child_supervisor
         self.running = threading.Event()
         self.stop_requested = threading.Event()
 
@@ -174,6 +176,10 @@ class ManagedDispatcher:
             or row["phase"] != "dispatching"
             or row["spec"] != _json(asdict(spec))
             or not row["binding"]
+            or (
+                self.child_supervisor is not None
+                and self.child_supervisor.retiring(model_binding.worker_id)
+            )
         ):
             return 0
         original = json.loads(row["binding"])
@@ -201,9 +207,29 @@ class ManagedDispatcher:
             or type(remaining) not in {int, float}
             or not math.isfinite(remaining)
             or remaining <= 0
+            or (
+                self.child_supervisor is not None
+                and self.child_supervisor.retiring(model_binding.worker_id)
+            )
         ):
             return 0
         return min(profile.max_seconds, remaining)
+
+    def child_root_active(self, context):
+        row = self.journal.get(context.worker_id)
+        if (
+            self.stop_requested.is_set()
+            or row is None
+            or row["phase"] != "dispatching"
+            or row["spec"] != _json(asdict(context.spec))
+            or not row["binding"]
+        ):
+            return False
+        binding = json.loads(row["binding"])["binding"]
+        return (
+            binding["attempt_id"] == context.attempt_id
+            and binding["worker_id"] == context.worker_id
+        )
 
     def _uses_model(self, spec):
         return (
@@ -387,6 +413,18 @@ class ManagedDispatcher:
 
             remaining = cutoff - time.monotonic()
             allowed = allowed and remaining > 0 and not self.stop_requested.is_set()
+            children = (
+                self.child_supervisor
+                if self.child_supervisor is not None
+                and self.child_supervisor.enabled(spec)
+                else None
+            )
+            if children is not None:
+                children.bind_root(worker_id, spec, bound, cutoff)
+                if allowed and row["phase"] != "cancelling":
+                    children.reconcile(worker_id)
+                if children.retiring(worker_id):
+                    allowed = False
             if allowed and row["phase"] != "cancelling" and self._uses_model(spec):
                 from src.worker.model_broker import BrokerDenied
 
@@ -442,6 +480,10 @@ class ManagedDispatcher:
             self._publish_capture(worker_id, spec, attempt_id, row, receipt)
 
     def _publish_capture(self, worker_id, spec, attempt_id, row, receipt):
+        if self.child_supervisor is not None and self.child_supervisor.enabled(spec):
+            # A canonical root terminal cannot precede any allocated child,
+            # including a grant whose reply was lost before local binding.
+            self.child_supervisor.finalize(worker_id, receipt)
         artifacts = json.loads(row["artifacts"])
         # The runtime supplies durable bytes, not arbitrary guest paths. Patch
         # and logs remain untrusted evidence; no test result is self-accepted.

@@ -109,14 +109,30 @@ class BrokerClient:
             raise BrokerError("agent context exceeds the bounded broker protocol")
         deadline = time.monotonic() + self.timeout_seconds
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(self.timeout_seconds)
-                connection.connect(self.socket_path)
-                connection.sendall(struct.pack("!I", len(request)) + request)
-                length = struct.unpack("!I", _receive(connection, 4, deadline))[0]
-                if not 1 <= length <= self.max_bytes:
-                    raise BrokerError("model broker response exceeds its limit")
-                result = json.loads(_receive(connection, length, deadline))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("original model request deadline expired")
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(remaining)
+                    connection.connect(self.socket_path)
+                    connection.sendall(struct.pack("!I", len(request)) + request)
+                    length = struct.unpack("!I", _receive(connection, 4, deadline))[0]
+                    if not 1 <= length <= self.max_bytes:
+                        raise BrokerError("model broker response exceeds its limit")
+                    result = json.loads(_receive(connection, length, deadline))
+                if (
+                    isinstance(result, dict)
+                    and result.get("schema_version") == 1
+                    and result.get("request_id") == request_id
+                    and result.get("ok") is False
+                    and result.get("error") in {"retry_later", "canonical_pending"}
+                ):
+                    # Freeze bytes/key once. Only known pre-provider states
+                    # may repeat within this original overall deadline.
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+                    continue
+                break
         except (OSError, ValueError, TimeoutError):
             # The caller must not invent a fresh request key after uncertainty.
             raise BrokerError(

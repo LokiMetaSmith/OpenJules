@@ -687,6 +687,25 @@ class WorkerLifecycle:
                     (worker_id, execution_id, parent_id),
                 )
 
+    def root_admission_open(
+        self, scope: WorkerScope, worker_id: str, root_id: str
+    ) -> bool:
+        """Read the local drain/lineage gate without trusting a cached runtime state.
+
+        This is only an early rejection gate for the trusted child supervisor.
+        Actual admission still uses begin_execution and its fresh observation.
+        """
+        with self._transaction() as connection:
+            row = self._get(connection, scope, worker_id)
+            return (
+                not row["draining"]
+                and not self._terminal(row)
+                and any(
+                    item["execution_id"] == root_id and item["parent_id"] is None
+                    for item in self._active(connection, worker_id)
+                )
+            )
+
     def record_execution_end(
         self,
         scope: WorkerScope,

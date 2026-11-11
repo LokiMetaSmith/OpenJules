@@ -69,6 +69,11 @@ host and adds only that worker's authenticated read-only socket mount. Model
 requests require the original admitted canonical binding and its current
 permission. Profiles without this configuration remain command-only.
 
+Optional `children` entries enable [bounded child agents](managed-children.md)
+for approved model profiles. They require a matching canonical child policy and
+a new immutable runtime profile. The root and children share one worker and one
+model allowance. Final child capture and terminal receipts precede root release.
+
 The dispatcher persists an immutable claim request before contacting Polyphony.
 A lost reply retains that same request identity. A generic conflict or transport
 failure is not evidence that no attempt was allocated. Only the authority's
@@ -96,11 +101,14 @@ containers, inaccessible Docker and unconfirmed start intents remain unknown.
 ## Current supported scope
 
 This release provides an authenticated, recoverable **root execution** path,
-with an optional host-owned model broker. Child delegation is unsupported.
+with an optional host-owned model broker and opt-in depth-one child execution.
+Children use distinct UIDs and canonical grants; a child deadline or cancellation
+retires its whole worker. Existing root-only profiles remain unchanged.
 The Docker network remains disabled; model traffic goes through the configured
 broker. Deterministic model and code-change trials prove transport, execution
-and capture, not live-provider behavior, model quality, child agents, independent
-review or forge publication.
+and capture, including the separately enabled child Docker qualification. They
+do not prove live-provider behavior, model quality, independent review or forge
+publication.
 
 Durable archives, stopped containers and volumes are retained for recovery.
 There is no automatic garbage collection or per-volume disk quota. The trusted

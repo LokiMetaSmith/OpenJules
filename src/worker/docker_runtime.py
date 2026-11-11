@@ -228,6 +228,7 @@ class ManagedDockerRuntime:
         docker_client=None,
         *,
         model_broker=None,
+        child_policies=None,
     ):
         self.root = Path(state_directory).resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -242,6 +243,23 @@ class ManagedDockerRuntime:
             )
         self.readiness = readiness
         self.model_broker = model_broker
+        self.child_policies = dict(child_policies or {})
+        self.child_supervisor = None
+        if self.child_policies:
+            from .child_types import ChildPolicy
+
+            if model_broker is None or not set(self.child_policies) <= set(
+                model_broker.policies
+            ):
+                raise ValueError(
+                    "child policies require approved model-backed profiles"
+                )
+            for key, policy in self.child_policies.items():
+                if key not in self.profiles or not isinstance(policy, ChildPolicy):
+                    raise ValueError("child policies require approved runtime profiles")
+                policy.validate_root(
+                    self.profiles[key].uid, self.profiles[key].max_seconds
+                )
         if model_broker is not None:
             if not set(model_broker.policies) <= set(self.profiles):
                 raise ValueError("model policies require approved runtime profiles")
@@ -270,6 +288,9 @@ class ManagedDockerRuntime:
                     seconds REAL NOT NULL,deadline REAL NOT NULL,exec_id TEXT,
                     exec_dispatched INTEGER NOT NULL DEFAULT 0,cancelled INTEGER NOT NULL DEFAULT 0,
                     exit_code INTEGER,FOREIGN KEY(worker_id) REFERENCES workers(worker_id));
+                CREATE TABLE IF NOT EXISTS child_profiles(
+                    deployment_id TEXT NOT NULL,repository TEXT NOT NULL,name TEXT NOT NULL,fingerprint TEXT,
+                    PRIMARY KEY(deployment_id,repository,name));
             """)
             for profile in profiles:
                 key = (profile.deployment_id, profile.repository, profile.name)
@@ -277,6 +298,25 @@ class ManagedDockerRuntime:
                     "SELECT fingerprint FROM profiles WHERE deployment_id=? AND repository=? AND name=?",
                     key,
                 ).fetchone()
+                child_policy = self.child_policies.get(key)
+                child_digest = child_policy.fingerprint if child_policy else None
+                child_old = db.execute(
+                    "SELECT fingerprint FROM child_profiles WHERE deployment_id=? AND repository=? AND name=?",
+                    key,
+                ).fetchone()
+                if child_old is None:
+                    if old is not None and child_digest is not None:
+                        raise LifecycleConflict(
+                            "enabling children requires a new approved profile and incarnation"
+                        )
+                    db.execute(
+                        "INSERT INTO child_profiles VALUES(?,?,?,?)",
+                        (*key, child_digest),
+                    )
+                elif child_old[0] != child_digest:
+                    raise LifecycleConflict(
+                        "child policy changed; use a new profile name"
+                    )
                 if old and old[0] != profile.fingerprint:
                     raise LifecycleConflict(
                         "approved profile changed; use a new profile name"
@@ -365,6 +405,27 @@ class ManagedDockerRuntime:
             authority = RuntimeCapabilities(
                 reason="canonical authority preflight failed"
             )
+        key = (scope.deployment_id, scope.repository, profile)
+        if key in self.child_policies:
+            from .child_types import ChildCapabilities
+
+            try:
+                if self.child_supervisor is None:
+                    raise RuntimeUnavailable("child supervisor is not installed")
+                self.child_supervisor.driver.check_topology()
+                self.child_supervisor.endpoints.check_ready()
+            except Exception:
+                return ChildCapabilities(
+                    profile_supported=True,
+                    reason="child runtime transport or UID mapping is unavailable",
+                )
+            return ChildCapabilities(
+                authority.usable,
+                authority.profile_supported is True,
+                authority.repository_access is True,
+                authority.reason,
+                children=authority.usable,
+            )
         return RuntimeCapabilities(
             managed_dispatch=authority.usable,
             profile_supported=authority.profile_supported is True,
@@ -422,6 +483,21 @@ class ManagedDockerRuntime:
             if not model["revoked"]:
                 approved[row["worker_id"]] = spec
         self.model_broker.restore_workers(approved)
+        if self.child_supervisor is not None:
+            for worker_id, spec in approved.items():
+                if self.child_supervisor.enabled(spec):
+                    self.child_supervisor.prepare_worker(
+                        worker_id, spec, self.model_broker.root / worker_id
+                    )
+                    try:
+                        self.child_supervisor.endpoints.restore(worker_id)
+                    except LifecycleConflict:
+                        # A prepared container can precede canonical root claim.
+                        if (
+                            self.child_supervisor.journal.worker(worker_id)["context"]
+                            is not None
+                        ):
+                            raise
 
     def _update(self, worker_id: str, **values):
         allowed = {
@@ -452,6 +528,9 @@ class ManagedDockerRuntime:
         key = (spec.deployment_id, spec.repository, spec.profile)
         if self.model_broker is not None and key in self.model_broker.policies:
             labels["openjules.model_policy"] = self.model_broker.policy_digests[key]
+        if key in self.child_policies:
+            labels["openjules.child_policy"] = self.child_policies[key].fingerprint
+            labels["openjules.child_protocol"] = "bounded-children-v1"
         return labels
 
     def _name(self, worker_id: str) -> str:
@@ -513,12 +592,21 @@ class ManagedDockerRuntime:
         if self.model_broker is not None and key in self.model_broker.policies:
             directory = self.model_broker.prepare_worker(worker_id, spec)
             volumes[str(directory)] = {"bind": "/run/openjules-model", "mode": "ro"}
+            if key in self.child_policies:
+                if self.child_supervisor is None:
+                    raise RuntimeUnavailable("child supervisor is not installed")
+                self.child_supervisor.prepare_worker(worker_id, spec, directory)
+        watchdog = _WATCHDOG
+        if key in self.child_policies:
+            from .child_runtime import CHILD_WATCHDOG
+
+            watchdog = CHILD_WATCHDOG
         self._update(worker_id, create_dispatched=1)
         return self.client.containers.create(
             profile.image,
             name=self._name(worker_id),
             labels=labels,
-            entrypoint=["python3", "-I", "-S", "-c", _WATCHDOG],
+            entrypoint=["python3", "-I", "-S", "-c", watchdog],
             command=[],
             user=f"{_WATCHDOG_UID}:{_WATCHDOG_UID}",
             working_dir="/",
@@ -588,9 +676,14 @@ class ManagedDockerRuntime:
                             reason="unexpected pre-launch state",
                         )
                     profile = self._profile(spec)
-                    if not container.put_archive(
-                        "/workspace", self._tar({"run": (None, profile.uid, 0o700)})
-                    ):
+                    workspace = {"run": (None, profile.uid, 0o700)}
+                    if (
+                        spec.deployment_id,
+                        spec.repository,
+                        spec.profile,
+                    ) in self.child_policies:
+                        workspace["children"] = (None, _WATCHDOG_UID, 0o711)
+                    if not container.put_archive("/workspace", self._tar(workspace)):
                         raise RuntimeUnavailable("workspace initialization failed")
                     self._update(worker_id, start_dispatched=1)
                     container.start()
@@ -721,6 +814,8 @@ class ManagedDockerRuntime:
                 )
 
     def drain(self, worker_id: str, spec: WorkerSpec, runtime_id: str | None):
+        if self.child_supervisor is not None and self.child_supervisor.enabled(spec):
+            self.child_supervisor.close_admission(worker_id)
         with self._lock(worker_id) as locked:
             if not locked:
                 return RuntimeObservation(
@@ -914,6 +1009,17 @@ class ManagedDockerRuntime:
                 if time.monotonic() >= deadline:
                     return self._retire_locked(worker_id, spec)
                 self.client.api.exec_start(exec_id, detach=True)
+                if (
+                    spec.deployment_id,
+                    spec.repository,
+                    spec.profile,
+                ) in self.child_policies:
+                    # Child admission needs the same worker fence while this
+                    # root runs. Later dispatcher ticks inspect this exact exec.
+                    return ExecutionReceipt(
+                        "running",
+                        reason="root execution dispatched under its original fence",
+                    )
                 while time.monotonic() < deadline:
                     observed = self.client.api.exec_inspect(exec_id)
                     if not observed.get("Running"):
@@ -1004,6 +1110,8 @@ class ManagedDockerRuntime:
         row = self._row(worker_id, spec, create=True)
         if row["receipt"]:
             return ExecutionReceipt(**json.loads(row["receipt"]))
+        if self.child_supervisor is not None and self.child_supervisor.enabled(spec):
+            self.child_supervisor.mark_retiring(worker_id)
         self._update(worker_id, retired=1)
         if not row["create_dispatched"] and row["container_id"] is None:
             receipt = ExecutionReceipt(
