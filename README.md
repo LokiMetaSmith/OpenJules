@@ -3,6 +3,22 @@
 OpenJules is an open-source, asynchronous, cloud-agnostic equivalent of Google Jules.
 The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-peer repositories (`rad:<rid>`)**, boots an isolated container sandbox (Docker-in-Docker / DinD), coordinates concurrent agents working on the same repository via **Keystone Polyphony**, executes an **Adaptive Agent Harness (Propose–Probe–Compose loop)** with **cloud or self-hosted LLMs (vLLM, llama.cpp, Ollama)**, and pushes the verified diff back as a **GitHub Pull Request** or **Radicle Patch**.
 
+## Managed deployment with ZPM
+
+Use the [managed service](docs/managed-service.md) for ZPM repository capacity.
+It connects the durable worker lifecycle to Polyphony's authenticated canonical
+authority and an [isolated Docker runtime](docs/managed-docker-runtime.md).
+The supported baseline executes one approved root command per immutable worker,
+preserves capture before release, and recovers delivery intents after restart.
+Source snapshots contain only the approved commit's objects; ignored host files
+and local Git configuration are excluded.
+
+This managed profile currently has no network, live model connection, delegated
+child agents or forge publication. Its real-container code-change tests establish
+execution and recovery behavior. The older webhook, in-memory collaboration and
+DinD paths described below do not satisfy this managed contract and are never
+used as a readiness fallback.
+
 ---
 
 ## Architecture Overview
