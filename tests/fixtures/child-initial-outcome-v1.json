@@ -1,0 +1,48 @@
+{
+  "description": "Deterministic interoperability vector, not a runtime or authority receipt.",
+  "binding": {
+    "deployment_id": "outcome-vector",
+    "repository": "github:github.com/example/project",
+    "child_id": "child_33333333333333333333333333333333",
+    "root_attempt_id": "attempt_11111111111111111111111111111111",
+    "parent_attempt_id": "attempt_11111111111111111111111111111111",
+    "task_id": "task_v2_2222222222222222222222222222222222222222222222222222222222222222",
+    "runtime_principal": "runtime",
+    "worker_id": "worker-vector",
+    "profile": "outcome-v1",
+    "profile_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+    "requirements_revision": 3,
+    "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "launch_key": "polyphony-child:child_33333333333333333333333333333333",
+    "allocated_seconds": 20,
+    "deadline": 120,
+    "max_turns": 2,
+    "capabilities": [
+      "python"
+    ],
+    "instructions_digest": "440de20591e5c6513d425cd07b72a12bcadcb76b0487af0599ab8a5d338794d2",
+    "grant_digest": "2f1ac81a45e03c131ff46d5745b6a1f48c7a83d5429d49f31377bfb486976b94"
+  },
+  "manifest": {
+    "schema_version": 1,
+    "work_outcome": {
+      "schema_version": 1,
+      "work_turn_id": "c4bb926161ce2ba9f3030a0bdccc8d14dfef4f2820c6b3787e25bd4613e7140d",
+      "ordinal": 1,
+      "child_id": "child_33333333333333333333333333333333",
+      "root_attempt_id": "attempt_11111111111111111111111111111111",
+      "parent_attempt_id": "attempt_11111111111111111111111111111111",
+      "task_id": "task_v2_2222222222222222222222222222222222222222222222222222222222222222",
+      "requirements_revision": 3,
+      "grant_digest": "2f1ac81a45e03c131ff46d5745b6a1f48c7a83d5429d49f31377bfb486976b94",
+      "instructions_digest": "440de20591e5c6513d425cd07b72a12bcadcb76b0487af0599ab8a5d338794d2",
+      "source": "child_report_via_bound_runtime",
+      "report": {
+        "request_key": "report:one",
+        "outcome": "needs_clarification",
+        "summary": "Which behavior should λ preserve?",
+        "payload_digest": "9fe765b407585b1b974a56e083b81efa0b416ef7e7470635048e26044181a9d3"
+      }
+    }
+  }
+}

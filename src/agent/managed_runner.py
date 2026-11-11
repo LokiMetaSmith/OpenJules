@@ -7,6 +7,7 @@ the final process-tree deadline. This program is not a host execution sandbox.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -318,6 +319,7 @@ def run_agent(
     *,
     max_turns: int = 25,
     verify_argv=None,
+    outcome_client=None,
 ) -> int:
     if (
         not isinstance(requirements, str)
@@ -345,6 +347,12 @@ def run_agent(
             + root_rules,
         },
     ]
+    if outcome_client is not None:
+        messages[0]["content"] += (
+            " You may decline, request clarification, or report failure using report_outcome "
+            "as your only terminal tool call. Its private summary is a self-report, not "
+            "runtime termination or task acceptance. finish reports completed."
+        )
     for turn in range(max_turns):
         message = client.complete(messages)
         messages.append(message)
@@ -357,21 +365,84 @@ def run_agent(
                 flush=True,
             )
             return 2
+        mixed_terminal = (
+            outcome_client is not None
+            and len(calls) != 1
+            and any(
+                call["function"]["name"] in {"finish", "report_outcome"}
+                for call in calls
+            )
+        )
         for call in calls:
             function = call["function"]
+            if mixed_terminal:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": "Tool error: a terminal child outcome must be the only call",
+                    }
+                )
+                continue
             try:
                 arguments = json.loads(function["arguments"])
             except (ValueError, TypeError):
                 arguments = None
-            if function["name"] == "finish":
+            is_report = (
+                function["name"] == "report_outcome" and outcome_client is not None
+            )
+            if function["name"] == "finish" or is_report:
+                required = {"outcome", "summary"} if is_report else {"summary"}
+                outcome = (
+                    arguments.get("outcome")
+                    if is_report and isinstance(arguments, dict)
+                    else "completed"
+                )
                 if (
                     len(calls) != 1
                     or not isinstance(arguments, dict)
-                    or set(arguments) != {"summary"}
+                    or set(arguments) != required
                     or not isinstance(arguments["summary"], str)
+                    or (
+                        outcome_client is not None
+                        and (
+                            not isinstance(outcome, str)
+                            or outcome
+                            not in {
+                                "completed",
+                                "declined",
+                                "needs_clarification",
+                                "failed",
+                            }
+                            or "\0" in arguments["summary"]
+                            or len(arguments["summary"].encode("utf-8")) > 8192
+                        )
+                    )
                 ):
-                    result = "Tool error: finish must be the only call and contain a text summary"
+                    result = (
+                        "Tool error: finish must be the only call and contain a text summary"
+                        if outcome_client is None
+                        else "Tool error: terminal outcome must be the only call with valid fields and summary"
+                    )
                 else:
+                    if outcome_client is not None:
+                        try:
+                            outcome_client.report(outcome, arguments["summary"])
+                        except Exception:
+                            raise BrokerError(
+                                "Child outcome remains unconfirmed; preserve captured work"
+                            ) from None
+                        if outcome != "completed":
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "child_report_retained",
+                                        "outcome": outcome,
+                                    }
+                                ),
+                                flush=True,
+                            )
+                            return 2 if outcome == "failed" else 0
                     print(
                         json.dumps(
                             {
@@ -419,10 +490,30 @@ def main():
     parser.add_argument("--socket", required=True)
     parser.add_argument("--max-turns", type=int, default=25)
     parser.add_argument(
+        "--outcome-socket", help="opt-in child-bound initial outcome socket"
+    )
+    parser.add_argument(
         "--verify-json", help="operator-approved verification argv as JSON"
     )
     args = parser.parse_args()
     try:
+        outcome_client = None
+        if args.outcome_socket:
+            if __package__:
+                from .child_outcome import OutcomeClient
+            else:
+                # Only the approved image sibling is imported. Repository
+                # contents, PYTHONPATH and the checkout never select this code.
+                path = Path(__file__).resolve().with_name("child_outcome.py")
+                specification = importlib.util.spec_from_file_location(
+                    "_openjules_child_outcome", path
+                )
+                if specification is None or specification.loader is None:
+                    raise ValueError("trusted child outcome module is unavailable")
+                module = importlib.util.module_from_spec(specification)
+                specification.loader.exec_module(module)
+                OutcomeClient = module.OutcomeClient
+            outcome_client = OutcomeClient(args.outcome_socket)
         requirements = sys.stdin.buffer.read(131073).decode()
         verification = json.loads(args.verify_json) if args.verify_json else None
         result = run_agent(
@@ -431,6 +522,7 @@ def main():
             requirements,
             max_turns=args.max_turns,
             verify_argv=verification,
+            outcome_client=outcome_client,
         )
     except (BrokerError, ValueError, OSError):
         print(

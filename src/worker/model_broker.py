@@ -225,11 +225,15 @@ class _UnixServer(socketserver.UnixStreamServer):
 
 
 class _Endpoint:
-    def __init__(self, broker, worker_id: str, directory: Path):
+    def __init__(
+        self, broker, worker_id: str, directory: Path, *, socket_name="model.sock"
+    ):
+        if socket_name not in {"model.sock", "outcome.sock"}:
+            raise ValueError("unsupported host endpoint name")
         self.stop_requested = threading.Event()
         self.directory = directory
         self.directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        self.socket_path = directory / "model.sock"
+        self.socket_path = directory / socket_name
         if self.socket_path.exists() or self.socket_path.is_symlink():
             if self.socket_path.is_symlink() or not stat.S_ISSOCK(
                 self.socket_path.lstat().st_mode
@@ -240,7 +244,7 @@ class _Endpoint:
         # Linux pathname lookup through an open directory avoids the 108-byte
         # Unix sockaddr limit for long deployment paths. The guest uses its
         # short, fixed mount path; the actual socket remains in this directory.
-        address = f"/proc/self/fd/{self.directory_fd}/model.sock"
+        address = f"/proc/self/fd/{self.directory_fd}/{socket_name}"
 
         class Handler(socketserver.BaseRequestHandler):
             def handle(self):
@@ -708,13 +712,20 @@ class ModelBroker:
         ):
             raise BrokerDenied("invalid_request")
         definitions = TOOL_DEFINITIONS
-        if child_id is None and self.child_supervisor is not None:
+        if self.child_supervisor is not None:
             with self.connection() as db:
                 spec = WorkerSpec(**json.loads(self._worker(db, worker_id)["spec"]))
-            if self.child_supervisor.enabled(spec):
+            if child_id is None and self.child_supervisor.enabled(spec):
                 from src.agent.child_tools import CHILD_TOOL_DEFINITIONS
 
                 definitions = [*TOOL_DEFINITIONS, *CHILD_TOOL_DEFINITIONS]
+            elif (
+                child_id is not None
+                and self.child_supervisor.policy(spec).outcome_protocol is not None
+            ):
+                from src.agent.child_outcome import OUTCOME_TOOL_DEFINITIONS
+
+                definitions = [*TOOL_DEFINITIONS, *OUTCOME_TOOL_DEFINITIONS]
         tool_names = {item["function"]["name"] for item in definitions}
         _messages(payload["messages"], tool_names)
         row, policy, deadline = self._context_permission(worker_id, child_id)

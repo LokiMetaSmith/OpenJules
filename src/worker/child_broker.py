@@ -15,6 +15,7 @@ import stat
 import struct
 import threading
 import time
+from types import SimpleNamespace
 
 from src.polyphony.managed_client import AuthorityUnavailable
 from .child_supervisor import ChildDenied
@@ -170,11 +171,29 @@ class _ChildModelContext:
         )
 
 
+class _ChildOutcomeContext(_ChildModelContext):
+    def policy_for_worker(self, child_id):
+        self._bound(child_id)
+        return SimpleNamespace(max_request_bytes=65536)
+
+    def complete(self, child_id, payload):
+        self._bound(child_id)
+        try:
+            return self.adapter.supervisor.report_outcome(
+                self.root.worker_id, self.child_id, payload
+            )
+        except ChildDenied as error:
+            raise BrokerDenied(error.code) from None
+        except LifecycleConflict:
+            raise BrokerDenied("conflict") from None
+
+
 class ChildBroker:
     def __init__(self, supervisor, model_broker):
         self.supervisor, self.model = supervisor, model_broker
         self.controls = {}
         self.children = {}
+        self.outcomes = {}
         self.guard = threading.RLock()
         self.closed = False
 
@@ -195,8 +214,6 @@ class ChildBroker:
             if self.closed:
                 raise RuntimeUnavailable("child transport is closed")
             existing = self.children.get(child_id)
-            if existing is not None and existing.thread.is_alive():
-                return
             parent = self.model.root / root.worker_id / "children"
             directory = parent / child_id
             for path in (parent, directory):
@@ -211,8 +228,10 @@ class ChildBroker:
                     raise ValueError(
                         "child endpoint directories must be owned mode0711 directories"
                     )
-            context = _ChildModelContext(self, root, child_id)
-            endpoint = _Endpoint(context, child_id, directory)
+            endpoint = existing
+            if existing is None or not existing.thread.is_alive():
+                context = _ChildModelContext(self, root, child_id)
+                endpoint = _Endpoint(context, child_id, directory)
             with self.model.guard:
                 if self.model.closed:
                     endpoint.stop()
@@ -221,6 +240,19 @@ class ChildBroker:
                 # The reserved key cannot be supplied as a worker UUID.
                 self.model.endpoints["/child/" + child_id] = endpoint
             self.children[child_id] = endpoint
+            if self.supervisor.policy(root.spec).outcome_protocol is not None:
+                outcome = self.outcomes.get(child_id)
+                if outcome is None or not outcome.thread.is_alive():
+                    context = _ChildOutcomeContext(self, root, child_id)
+                    outcome = _Endpoint(
+                        context, child_id, directory, socket_name="outcome.sock"
+                    )
+                    with self.model.guard:
+                        if self.model.closed:
+                            outcome.stop()
+                            raise RuntimeUnavailable("root model broker is closed")
+                        self.model.endpoints["/child-outcome/" + child_id] = outcome
+                    self.outcomes[child_id] = outcome
 
     def restore(self, worker_id):
         root = self.supervisor.journal.context(worker_id)
@@ -232,7 +264,11 @@ class ChildBroker:
     def check_ready(self):
         if self.closed or any(
             not endpoint.thread.is_alive()
-            for endpoint in [*self.controls.values(), *self.children.values()]
+            for endpoint in [
+                *self.controls.values(),
+                *self.children.values(),
+                *self.outcomes.values(),
+            ]
             if not endpoint.stop_requested.is_set()
         ):
             raise RuntimeUnavailable("child transport listener is unavailable")
@@ -247,11 +283,18 @@ class ChildBroker:
                 endpoint = self.children.get(child["child_id"])
                 if endpoint is not None:
                     endpoint.stop()
+                outcome = self.outcomes.get(child["child_id"])
+                if outcome is not None:
+                    outcome.stop()
 
     def close(self, released):
         with self.guard:
             self.closed = True
-            endpoints = [*self.controls.values(), *self.children.values()]
+            endpoints = [
+                *self.controls.values(),
+                *self.children.values(),
+                *self.outcomes.values(),
+            ]
             for endpoint in endpoints:
                 endpoint.stop()
         deadline = time.monotonic() + 1

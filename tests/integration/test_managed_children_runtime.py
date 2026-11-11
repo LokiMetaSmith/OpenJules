@@ -187,7 +187,7 @@ class ChildAuthorityFixture:
             )
             record["terminal"] = True
             self.stack.authority.events.append(("child_terminal", child_id))
-            return {
+            result = {
                 "child": record["response"]["child"]
                 | {
                     "state": payload["state"],
@@ -196,6 +196,14 @@ class ChildAuthorityFixture:
                     "captured_artifacts": hashes,
                 }
             }
+            outcome = json.loads(record["artifacts"]["manifest"]).get("work_outcome")
+            if outcome is not None:
+                result["child"]["initial_outcome"] = outcome | {
+                    "artifacts": hashes,
+                    "canonical_committed": True,
+                    "release_authorized": False,
+                }
+            return result
         raise AssertionError(operation)
 
     def children(self, scope, attempt_id):
@@ -303,6 +311,7 @@ def child_stack(
     sleeping_root=False,
     seconds=60,
     child_seconds=40,
+    outcome_protocol=None,
 ):
     client, image = agent_image
     source, base = make_source(tmp_path)
@@ -341,6 +350,7 @@ def child_stack(
         4,
         ("python",),
         verify_argv=("python3", "-I", "-c", CHILD_VERIFY),
+        outcome_protocol=outcome_protocol,
     )
     stack = SimpleNamespace(
         client=client,

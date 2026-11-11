@@ -11,6 +11,7 @@ import pytest
 from src.polyphony.managed_client import AuthorityUnavailable
 from src.worker.child_supervisor import ChildDenied
 from src.worker.model_broker import BrokerDenied, ModelPolicy
+from tests.unit.test_child_authority_contract import policy
 from tests.unit.test_managed_agent import (
     ATTEMPT,
     MESSAGES,
@@ -33,6 +34,9 @@ class ChildAuthorityFixture:
 
     def enabled(self, spec):
         return True
+
+    def policy(self, spec):
+        return policy()
 
     def permission(self, worker_id, child_id):
         if self.on_permission:
