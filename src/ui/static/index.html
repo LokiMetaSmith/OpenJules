@@ -40,6 +40,21 @@
           <div class="empty-state">No active locks held.</div>
         </div>
 
+        <div class="section-title" style="margin-top: 20px;">COHORT RESOURCE SCALER</div>
+        <div class="cohort-telemetry-card" id="cohort-telemetry" style="background: rgba(255,255,255,0.03); padding: 10px; border-radius: 6px; font-size: 12px;">
+          <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+            <span>Workers:</span>
+            <span id="cohort-workers-stat" style="font-weight:bold; color: #4ade80;">0 Active (0 Burst)</span>
+          </div>
+          <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+            <span>Host Budget:</span>
+            <span id="cohort-budget-stat" style="font-weight:bold; color: #38bdf8;">$0.00 / $100.00</span>
+          </div>
+          <div style="margin-top: 8px;">
+            <button class="btn btn-sm" style="width: 100%; font-size: 11px; padding: 4px;" onclick="fetchCohortTelemetry()">Refresh Swarm Telemetry</button>
+          </div>
+        </div>
+
         <div class="section-title" style="margin-top: 20px;">WORKSPACE FILES</div>
         <div class="file-tree" id="file-tree">
           <div class="tree-item">📁 src/</div>
