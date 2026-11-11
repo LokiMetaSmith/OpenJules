@@ -1,0 +1,815 @@
+"""Bounded model inference over a worker-specific Unix socket.
+
+Only the trusted host constructs this service and binds canonical attempts.
+The socket grants inference, never commands, task ownership or acceptance.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import socket
+import socketserver
+import sqlite3
+import stat
+import struct
+import threading
+import time
+from typing import Callable, Mapping
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+import httpx
+
+from src.agent.managed_runner import TOOL_DEFINITIONS
+from src.worker.lifecycle import WorkerSpec
+
+_TOOLS = {item["function"]["name"] for item in TOOL_DEFINITIONS}
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def _json(value) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _hash(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+class BrokerDenied(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class ModelPolicy:
+    endpoint: str
+    model: str
+    token_ref: str
+    max_calls: int = 25
+    max_output_tokens: int = 2048
+    max_total_output_tokens: int = 32768
+    request_timeout_seconds: float = 30
+    max_request_bytes: int = 524288
+    max_response_bytes: int = 2097152
+    token_parameter: str = "max_tokens"
+
+    def __post_init__(self):
+        parts = urlsplit(self.endpoint)
+        if (
+            parts.scheme not in {"https", "http"}
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or not parts.path.endswith("/chat/completions")
+            or (
+                parts.scheme == "http"
+                and parts.hostname not in {"127.0.0.1", "::1", "localhost"}
+            )
+        ):
+            raise ValueError(
+                "model endpoint requires an HTTPS completions URL or loopback HTTP"
+            )
+        parts.port
+        if (
+            not isinstance(self.model, str)
+            or not self.model
+            or len(self.model) > 256
+            or any(c.isspace() for c in self.model)
+        ):
+            raise ValueError("an explicit bounded model identifier is required")
+        if not isinstance(self.token_ref, str) or not re.fullmatch(
+            r"env:[A-Z_][A-Z0-9_]*", self.token_ref
+        ):
+            raise ValueError("model credential must be an environment reference")
+        for name, lower, upper in (
+            ("max_calls", 1, 1000),
+            ("max_output_tokens", 1, 32768),
+            ("max_total_output_tokens", 1, 10_000_000),
+            ("max_request_bytes", 1024, 524288),
+            ("max_response_bytes", 1024, 2097152),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError(f"invalid model {name}")
+        if (
+            type(self.request_timeout_seconds) not in {int, float}
+            or not math.isfinite(self.request_timeout_seconds)
+            or not 0 < self.request_timeout_seconds <= 120
+        ):
+            raise ValueError("invalid model request timeout")
+        if self.token_parameter not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("unsupported model output token parameter")
+
+    @property
+    def fingerprint(self) -> str:
+        return _hash(_json(asdict(self)))
+
+
+@dataclass(frozen=True)
+class ModelBinding:
+    worker_id: str
+    attempt_id: str
+    spec: WorkerSpec
+
+    @property
+    def scope(self):
+        return self.spec.scope
+
+
+def _tool_call(value):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"id", "type", "function"}
+        or value["type"] != "function"
+    ):
+        raise BrokerDenied("invalid_request")
+    function = value["function"]
+    if (
+        not isinstance(value["id"], str)
+        or not _IDENTIFIER.fullmatch(value["id"])
+        or not isinstance(function, dict)
+        or set(function) != {"name", "arguments"}
+        or function["name"] not in _TOOLS
+        or not isinstance(function["arguments"], str)
+        or len(function["arguments"].encode()) > 150000
+    ):
+        raise BrokerDenied("invalid_request")
+    return value
+
+
+def _messages(value):
+    if not isinstance(value, list) or not 1 <= len(value) <= 256:
+        raise BrokerDenied("invalid_request")
+    for message in value:
+        if not isinstance(message, dict) or message.get("role") not in {
+            "system",
+            "user",
+            "assistant",
+            "tool",
+        }:
+            raise BrokerDenied("invalid_request")
+        role = message["role"]
+        allowed = {"role", "content"}
+        required = {"role", "content"}
+        if role == "assistant":
+            allowed.add("tool_calls")
+        elif role == "tool":
+            allowed.add("tool_call_id")
+            required.add("tool_call_id")
+        if not required <= set(message) or not set(message) <= allowed:
+            raise BrokerDenied("invalid_request")
+        if not isinstance(message["content"], str) and not (
+            role == "assistant" and message["content"] is None
+        ):
+            raise BrokerDenied("invalid_request")
+        if role == "tool" and (
+            not isinstance(message["tool_call_id"], str)
+            or not _IDENTIFIER.fullmatch(message["tool_call_id"])
+        ):
+            raise BrokerDenied("invalid_request")
+        calls = message.get("tool_calls", [])
+        if not isinstance(calls, list) or len(calls) > 8:
+            raise BrokerDenied("invalid_request")
+        for call in calls:
+            _tool_call(call)
+    return value
+
+
+def _assistant(value):
+    if not isinstance(value, dict) or value.get("role") != "assistant":
+        raise BrokerDenied("provider_unavailable")
+    result = {"role": "assistant", "content": value.get("content")}
+    if value.get("tool_calls"):
+        result["tool_calls"] = value["tool_calls"]
+    try:
+        _messages([result])
+    except BrokerDenied:
+        raise BrokerDenied("provider_unavailable") from None
+    return result
+
+
+def _pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+class _UnixServer(socketserver.UnixStreamServer):
+    request_queue_size = 4
+    timeout = 0.1
+
+    def handle_error(self, request, client_address):
+        # Socket failures and untrusted content must not print provider data.
+        pass
+
+
+class _Endpoint:
+    def __init__(self, broker, worker_id: str, directory: Path):
+        self.stop_requested = threading.Event()
+        self.directory = directory
+        self.directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        self.socket_path = directory / "model.sock"
+        if self.socket_path.exists() or self.socket_path.is_symlink():
+            if self.socket_path.is_symlink() or not stat.S_ISSOCK(
+                self.socket_path.lstat().st_mode
+            ):
+                os.close(self.directory_fd)
+                raise ValueError("model endpoint path is not an owned socket")
+            self.socket_path.unlink()
+        # Linux pathname lookup through an open directory avoids the 108-byte
+        # Unix sockaddr limit for long deployment paths. The guest uses its
+        # short, fixed mount path; the actual socket remains in this directory.
+        address = f"/proc/self/fd/{self.directory_fd}/model.sock"
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                request_id = "invalid"
+                try:
+                    _, uid, _ = struct.unpack(
+                        "3i",
+                        self.request.getsockopt(
+                            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                        ),
+                    )
+                    if uid != broker.peer_uid_for_worker(worker_id):
+                        raise BrokerDenied("not_authorized")
+                    deadline = time.monotonic() + 5
+                    length = struct.unpack(
+                        "!I", broker._read(self.request, 4, deadline)
+                    )[0]
+                    policy = broker.policy_for_worker(worker_id)
+                    if not 1 <= length <= policy.max_request_bytes:
+                        raise BrokerDenied("invalid_request")
+                    body = broker._read(self.request, length, deadline)
+                    payload = json.loads(body, object_pairs_hook=_pairs)
+                    if (
+                        isinstance(payload, dict)
+                        and isinstance(payload.get("request_id"), str)
+                        and _IDENTIFIER.fullmatch(payload["request_id"])
+                    ):
+                        request_id = payload["request_id"]
+                    result = broker.complete(worker_id, payload)
+                except BrokerDenied as exc:
+                    result = {
+                        "schema_version": 1,
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": exc.code,
+                    }
+                except Exception:
+                    result = {
+                        "schema_version": 1,
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": "invalid_request",
+                    }
+                encoded = _json(result).encode()
+                self.request.settimeout(5)
+                self.request.sendall(struct.pack("!I", len(encoded)) + encoded)
+
+        try:
+            self.server = _UnixServer(address, Handler)
+            self.socket_path.chmod(0o666)
+        except BaseException:
+            os.close(self.directory_fd)
+            raise
+        self.thread = threading.Thread(
+            target=self._serve, daemon=True, name="worker-model-broker"
+        )
+        self.thread.start()
+
+    def _serve(self):
+        try:
+            while not self.stop_requested.is_set():
+                self.server.handle_request()
+        finally:
+            self.server.server_close()
+            if self.socket_path.exists():
+                self.socket_path.unlink()
+            os.close(self.directory_fd)
+
+    def stop(self):
+        self.stop_requested.set()
+
+
+class ModelBroker:
+    def __init__(
+        self,
+        state_directory: str | Path,
+        policies: Mapping[tuple[str, str, str], ModelPolicy],
+        permission: Callable[[ModelBinding], float],
+        *,
+        peer_uids: Mapping[tuple[str, str, str], int] | None = None,
+    ):
+        self.root = Path(state_directory).resolve()
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if stat.S_IMODE(self.root.stat().st_mode) & 0o077:
+            raise ValueError("model broker state directory must have mode 0700")
+        self.policies = dict(policies)
+        if (
+            not self.policies
+            or not callable(permission)
+            or not all(isinstance(p, ModelPolicy) for p in self.policies.values())
+        ):
+            raise ValueError(
+                "approved model policies and canonical permission callback required"
+            )
+        self.peer_uids = {key: 65532 for key in self.policies}
+        configured_uids = dict(peer_uids or {})
+        if set(configured_uids) - set(self.policies) or any(
+            type(uid) is not int or not 0 <= uid <= (1 << 31) - 1
+            for uid in configured_uids.values()
+        ):
+            raise ValueError("model peer UIDs must match approved profile scopes")
+        self.peer_uids.update(configured_uids)
+        self.policy_digests = {
+            key: _hash(
+                _json({"policy": policy.fingerprint, "peer_uid": self.peer_uids[key]})
+            )
+            for key, policy in self.policies.items()
+        }
+        self.permission = permission
+        self.boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        self.database = self.root / "inference.sqlite3"
+        self.guard = threading.RLock()
+        self.endpoints = {}
+        self.closed = False
+        self._service_lock = (self.root / "service.lock").open("a")
+        try:
+            fcntl.flock(self._service_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._service_lock.close()
+            raise ValueError("another model broker owns this state") from None
+        try:
+            with self.connection() as db:
+                db.executescript(
+                    "CREATE TABLE IF NOT EXISTS policies(scope TEXT PRIMARY KEY,fingerprint TEXT NOT NULL);"
+                    "CREATE TABLE IF NOT EXISTS workers (worker_id TEXT PRIMARY KEY, spec TEXT NOT NULL, "
+                    "policy_digest TEXT NOT NULL, attempt_id TEXT, deadline REAL, boot_id TEXT, revoked INTEGER NOT NULL DEFAULT 0);"
+                    "CREATE TABLE IF NOT EXISTS calls (worker_id TEXT NOT NULL, attempt_id TEXT NOT NULL, request_id TEXT NOT NULL, "
+                    "payload_hash TEXT NOT NULL, reserved_tokens INTEGER NOT NULL, status TEXT NOT NULL, response TEXT, "
+                    "PRIMARY KEY(worker_id,attempt_id,request_id));"
+                )
+                db.execute("BEGIN IMMEDIATE")
+                for key, policy in self.policies.items():
+                    if not isinstance(key, tuple) or len(key) != 3:
+                        raise ValueError(
+                            "model policy requires deployment, repository and profile"
+                        )
+                    WorkerSpec(key[0], key[1], "policy", 1, "policy", key[2])
+                    scope = _json(key)
+                    fingerprint = self.policy_digests[key]
+                    db.execute(
+                        "INSERT OR IGNORE INTO policies VALUES(?,?)",
+                        (scope, fingerprint),
+                    )
+                    if (
+                        db.execute(
+                            "SELECT fingerprint FROM policies WHERE scope=?", (scope,)
+                        ).fetchone()[0]
+                        != fingerprint
+                    ):
+                        raise ValueError(
+                            "approved model policy changed; use a new profile name"
+                        )
+        except BaseException:
+            self._service_lock.close()
+            raise
+
+    @contextmanager
+    def connection(self):
+        db = sqlite3.connect(self.database, timeout=10)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA synchronous=FULL")
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
+
+    @staticmethod
+    def _read(connection, size: int, deadline: float) -> bytes:
+        content = bytearray()
+        while len(content) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BrokerDenied("invalid_request")
+            connection.settimeout(remaining)
+            part = connection.recv(min(65536, size - len(content)))
+            if not part:
+                raise BrokerDenied("invalid_request")
+            content.extend(part)
+        return bytes(content)
+
+    def _worker(self, db, worker_id):
+        row = db.execute(
+            "SELECT * FROM workers WHERE worker_id=?", (worker_id,)
+        ).fetchone()
+        if row is None:
+            raise BrokerDenied("not_authorized")
+        return row
+
+    def _policy(self, spec):
+        policy = self.policies.get((spec.deployment_id, spec.repository, spec.profile))
+        if policy is None:
+            raise BrokerDenied("not_authorized")
+        return policy
+
+    def policy_for_worker(self, worker_id):
+        with self.connection() as db:
+            return self._policy(
+                WorkerSpec(**json.loads(self._worker(db, worker_id)["spec"]))
+            )
+
+    def peer_uid_for_worker(self, worker_id):
+        with self.connection() as db:
+            spec = WorkerSpec(**json.loads(self._worker(db, worker_id)["spec"]))
+        return self.peer_uids[(spec.deployment_id, spec.repository, spec.profile)]
+
+    def check_ready(self) -> None:
+        """Prove local transport availability without creating an inference grant.
+
+        The service must restore its known live workers first. This probe does
+        not infer which journalled workers the canonical runtime still owns.
+        """
+        with self.guard:
+            if self.closed or any(
+                not endpoint.thread.is_alive()
+                for endpoint in self.endpoints.values()
+                if not endpoint.stop_requested.is_set()
+            ):
+                raise BrokerDenied("model_transport_unavailable")
+            descriptor = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            name = "probe-" + uuid4().hex
+            path = self.root / name
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.bind(f"/proc/self/fd/{descriptor}/{name}")
+                    probe.listen(1)
+            except OSError:
+                raise BrokerDenied("model_transport_unavailable") from None
+            finally:
+                if path.exists():
+                    path.unlink()
+                os.close(descriptor)
+
+    def restore_workers(
+        self, live_workers: Mapping[str, WorkerSpec]
+    ) -> dict[str, Path]:
+        """Rebind listeners for the trusted runtime's exact live worker set.
+
+        Only existing, unrevoked immutable records may be restored. Historical
+        rows do not create listeners or new authority merely on broker restart.
+        """
+        restored = {}
+        for worker_id, spec in live_workers.items():
+            with self.connection() as db:
+                row = self._worker(db, worker_id)
+                if row["revoked"] or row["spec"] != _json(asdict(spec)):
+                    raise BrokerDenied("not_authorized")
+            restored[worker_id] = self.prepare_worker(worker_id, spec)
+        return restored
+
+    def prepare_worker(self, worker_id: str, spec: WorkerSpec) -> Path:
+        if not isinstance(worker_id, str) or not re.fullmatch(
+            r"[0-9a-f]{32}", worker_id
+        ):
+            raise ValueError("model endpoint requires an immutable worker UUID")
+        self._policy(spec)
+        fingerprint = self.policy_digests[
+            (spec.deployment_id, spec.repository, spec.profile)
+        ]
+        with self.guard:
+            if self.closed:
+                raise ValueError("model broker is closed")
+            with self.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    "INSERT OR IGNORE INTO workers(worker_id,spec,policy_digest) VALUES(?,?,?)",
+                    (worker_id, _json(asdict(spec)), fingerprint),
+                )
+                row = self._worker(db, worker_id)
+                if (
+                    row["spec"] != _json(asdict(spec))
+                    or row["policy_digest"] != fingerprint
+                ):
+                    raise ValueError("worker model binding changed")
+            directory = self.root / worker_id
+            if not directory.exists():
+                directory.mkdir(mode=0o711)
+                directory.chmod(0o711)
+            if (
+                directory.is_symlink()
+                or stat.S_IMODE(directory.stat().st_mode) != 0o711
+            ):
+                raise ValueError(
+                    "model endpoint directory must be an owned mode0711 directory"
+                )
+            endpoint = self.endpoints.get(worker_id)
+            if not row["revoked"] and (
+                endpoint is None or not endpoint.thread.is_alive()
+            ):
+                self.endpoints[worker_id] = _Endpoint(self, worker_id, directory)
+            return directory
+
+    def bind_attempt(
+        self,
+        worker_id: str,
+        spec: WorkerSpec,
+        attempt_id: str,
+        remaining_seconds: float,
+        *,
+        deadline_monotonic: float | None = None,
+    ):
+        started = time.monotonic()
+        if not isinstance(attempt_id, str) or not _IDENTIFIER.fullmatch(attempt_id):
+            raise ValueError("invalid canonical attempt identity")
+        if (
+            type(remaining_seconds) not in {int, float}
+            or not math.isfinite(remaining_seconds)
+            or not 0 < remaining_seconds <= 86400
+        ):
+            raise ValueError("invalid canonical remaining duration")
+        deadline = started + remaining_seconds
+        if deadline_monotonic is not None:
+            if (
+                type(deadline_monotonic) not in {int, float}
+                or not math.isfinite(deadline_monotonic)
+                or deadline_monotonic <= 0
+            ):
+                raise ValueError("invalid original monotonic cutoff")
+            deadline = min(deadline, deadline_monotonic)
+        if deadline <= time.monotonic():
+            raise BrokerDenied("not_authorized")
+        self.prepare_worker(worker_id, spec)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self._worker(db, worker_id)
+            if row["revoked"] or (
+                row["attempt_id"] is not None and row["attempt_id"] != attempt_id
+            ):
+                raise BrokerDenied("not_authorized")
+            if row["boot_id"] is not None and row["boot_id"] != self.boot_id:
+                raise BrokerDenied("not_authorized")
+            if row["deadline"] is not None:
+                deadline = min(deadline, row["deadline"])
+            if deadline <= time.monotonic():
+                raise BrokerDenied("not_authorized")
+            db.execute(
+                "UPDATE workers SET attempt_id=?,deadline=?,boot_id=? WHERE worker_id=?",
+                (attempt_id, deadline, self.boot_id, worker_id),
+            )
+
+    def revoke_attempt(self, worker_id: str, attempt_id: str):
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self._worker(db, worker_id)
+            if row["attempt_id"] != attempt_id:
+                raise BrokerDenied("not_authorized")
+            db.execute("UPDATE workers SET revoked=1 WHERE worker_id=?", (worker_id,))
+        with self.guard:
+            endpoint = self.endpoints.get(worker_id)
+            if endpoint:
+                endpoint.stop()
+
+    def _authorized(self, worker_id):
+        if self.closed:
+            raise BrokerDenied("not_authorized")
+        with self.connection() as db:
+            row = dict(self._worker(db, worker_id))
+        if (
+            self.closed
+            or row["revoked"]
+            or not row["attempt_id"]
+            or row["boot_id"] != self.boot_id
+            or row["deadline"] <= time.monotonic()
+        ):
+            raise BrokerDenied("not_authorized")
+        spec = WorkerSpec(**json.loads(row["spec"]))
+        policy = self._policy(spec)
+        if (
+            self.policy_digests[(spec.deployment_id, spec.repository, spec.profile)]
+            != row["policy_digest"]
+        ):
+            raise BrokerDenied("not_authorized")
+        started = time.monotonic()
+        try:
+            remaining = self.permission(
+                ModelBinding(worker_id, row["attempt_id"], spec)
+            )
+        except Exception:
+            raise BrokerDenied("not_authorized") from None
+        if (
+            type(remaining) not in {int, float}
+            or not math.isfinite(remaining)
+            or remaining <= 0
+        ):
+            raise BrokerDenied("not_authorized")
+        # Permission transport can outlive a local cancellation, shutdown or
+        # shortened binding. Never turn its delayed reply into fresh admission.
+        with self.guard:
+            with self.connection() as db:
+                current = dict(self._worker(db, worker_id))
+            if (
+                self.closed
+                or current["revoked"]
+                or any(
+                    current[key] != row[key]
+                    for key in ("spec", "policy_digest", "attempt_id", "boot_id")
+                )
+                or current["deadline"] <= time.monotonic()
+            ):
+                raise BrokerDenied("not_authorized")
+        deadline = min(row["deadline"], current["deadline"], started + remaining)
+        if deadline <= time.monotonic():
+            raise BrokerDenied("not_authorized")
+        return row, policy, deadline
+
+    def complete(self, worker_id: str, payload: dict) -> dict:
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"schema_version", "request_id", "messages"}
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 1
+            or not isinstance(payload["request_id"], str)
+            or not _IDENTIFIER.fullmatch(payload["request_id"])
+        ):
+            raise BrokerDenied("invalid_request")
+        _messages(payload["messages"])
+        row, policy, deadline = self._authorized(worker_id)
+        normalized = _json(payload)
+        if len(normalized.encode()) > policy.max_request_bytes:
+            raise BrokerDenied("invalid_request")
+        identity = (worker_id, row["attempt_id"], payload["request_id"])
+        digest = _hash(normalized)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = self._worker(db, worker_id)
+            if (
+                current["revoked"]
+                or current["attempt_id"] != row["attempt_id"]
+                or current["deadline"] <= time.monotonic()
+            ):
+                raise BrokerDenied("not_authorized")
+            prior = db.execute(
+                "SELECT * FROM calls WHERE worker_id=? AND attempt_id=? AND request_id=?",
+                identity,
+            ).fetchone()
+            if prior:
+                if prior["payload_hash"] != digest:
+                    raise BrokerDenied("conflict")
+                if prior["status"] != "complete":
+                    raise BrokerDenied("uncertain")
+                return json.loads(prior["response"])
+            if db.execute(
+                "SELECT 1 FROM calls WHERE worker_id=? AND attempt_id=? AND status!='complete'",
+                identity[:2],
+            ).fetchone():
+                raise BrokerDenied("uncertain")
+            count, reserved = db.execute(
+                "SELECT COUNT(*),COALESCE(SUM(reserved_tokens),0) FROM calls WHERE worker_id=? AND attempt_id=?",
+                identity[:2],
+            ).fetchone()
+            available = policy.max_total_output_tokens - reserved
+            if count >= policy.max_calls or available <= 0:
+                raise BrokerDenied("budget_exhausted")
+            tokens = min(policy.max_output_tokens, available)
+            db.execute(
+                "INSERT INTO calls VALUES(?,?,?,?,?,'reserved',NULL)",
+                (*identity, digest, tokens),
+            )
+        try:
+            # Reserving the durable budget may wait on a database writer. Do
+            # not dispatch using permission sampled before that wait.
+            _, _, current_deadline = self._authorized(worker_id)
+            deadline = min(deadline, current_deadline)
+            response = asyncio.run(
+                self._forward(policy, payload["messages"], tokens, deadline)
+            )
+            result = {
+                "schema_version": 1,
+                "request_id": payload["request_id"],
+                "ok": True,
+                "message": response,
+            }
+            with self.connection() as db:
+                db.execute(
+                    "UPDATE calls SET status='complete',response=? WHERE worker_id=? AND attempt_id=? AND request_id=?",
+                    (_json(result), *identity),
+                )
+            # Revocation can race an already dispatched inference call. Its
+            # budget stays charged, but it grants no fresh permission or output.
+            self._authorized(worker_id)
+            return result
+        except BrokerDenied:
+            with self.connection() as db:
+                db.execute(
+                    "UPDATE calls SET status='uncertain' WHERE worker_id=? AND attempt_id=? AND request_id=? AND status='reserved'",
+                    identity,
+                )
+            raise
+        except Exception:
+            with self.connection() as db:
+                db.execute(
+                    "UPDATE calls SET status='uncertain' WHERE worker_id=? AND attempt_id=? AND request_id=? AND status='reserved'",
+                    identity,
+                )
+            raise BrokerDenied("uncertain") from None
+
+    async def _forward(self, policy, messages, tokens, deadline):
+        token = os.environ.get(policy.token_ref[4:], "")
+        if not token or any(c.isspace() for c in token):
+            raise BrokerDenied("provider_unavailable")
+        remaining = min(policy.request_timeout_seconds, deadline - time.monotonic())
+        if remaining <= 0:
+            raise BrokerDenied("not_authorized")
+        body = {
+            "model": policy.model,
+            "messages": messages,
+            "tools": TOOL_DEFINITIONS,
+            "tool_choice": "auto",
+            "stream": False,
+            policy.token_parameter: tokens,
+        }
+        try:
+            async with asyncio.timeout(remaining):
+                async with httpx.AsyncClient(
+                    trust_env=False, follow_redirects=False, timeout=remaining
+                ) as client:
+                    async with client.stream(
+                        "POST",
+                        policy.endpoint,
+                        json=body,
+                        headers={
+                            "Authorization": "Bearer " + token,
+                            "Accept-Encoding": "identity",
+                        },
+                    ) as response:
+                        if response.status_code != 200 or response.headers.get(
+                            "Content-Encoding", "identity"
+                        ) not in {"", "identity"}:
+                            raise BrokerDenied("provider_unavailable")
+                        raw = bytearray()
+                        async for part in response.aiter_raw():
+                            raw.extend(part)
+                            if len(raw) > policy.max_response_bytes:
+                                raise BrokerDenied("provider_unavailable")
+                        value = json.loads(raw, object_pairs_hook=_pairs)
+            choices = value.get("choices") if isinstance(value, dict) else None
+            if (
+                not isinstance(choices, list)
+                or not choices
+                or not isinstance(choices[0], dict)
+            ):
+                raise BrokerDenied("provider_unavailable")
+            return _assistant(choices[0].get("message"))
+        except BrokerDenied:
+            raise
+        except Exception:
+            raise BrokerDenied("uncertain") from None
+
+    def close(self):
+        with self.guard:
+            if self.closed:
+                return
+            self.closed = True
+            endpoints = list(self.endpoints.values())
+            self.endpoints.clear()
+            for endpoint in endpoints:
+                endpoint.stop()
+        deadline = time.monotonic() + 1
+        for endpoint in endpoints:
+            endpoint.thread.join(max(0, deadline - time.monotonic()))
+        # Do not release ownership while an in-flight thread can still mutate
+        # this journal. Callers may retry close after the bounded request ends.
+        if any(endpoint.thread.is_alive() for endpoint in endpoints):
+
+            def release_when_stopped():
+                for endpoint in endpoints:
+                    endpoint.thread.join()
+                self._service_lock.close()
+
+            threading.Thread(target=release_when_stopped, daemon=True).start()
+        else:
+            self._service_lock.close()

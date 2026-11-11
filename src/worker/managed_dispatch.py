@@ -139,6 +139,7 @@ class ManagedDispatcher:
         *,
         poll_interval_seconds: float = 1,
         max_parallel: int = 16,
+        model_broker=None,
     ):
         if (
             isinstance(poll_interval_seconds, bool)
@@ -156,11 +157,70 @@ class ManagedDispatcher:
         self.journal = DispatchJournal(state_directory)
         self.poll_interval_seconds = poll_interval_seconds
         self.max_parallel = max_parallel
+        self.model_broker = model_broker
         self.running = threading.Event()
         self.stop_requested = threading.Event()
 
     def profile(self, spec: WorkerSpec):
         return self.profiles[(spec.deployment_id, spec.repository, spec.profile)]
+
+    def model_permission(self, model_binding):
+        """Authorize inference against the original admitted canonical binding."""
+        spec = model_binding.spec
+        row = self.journal.get(model_binding.worker_id)
+        if (
+            self.stop_requested.is_set()
+            or row is None
+            or row["phase"] != "dispatching"
+            or row["spec"] != _json(asdict(spec))
+            or not row["binding"]
+        ):
+            return 0
+        original = json.loads(row["binding"])
+        profile = self.profile(spec)
+        attempt_id = self._verify_binding(
+            original, spec, model_binding.worker_id, profile, model_binding.attempt_id
+        )
+        permission = self.authority.call(
+            "permission", spec.scope, attempt_id=attempt_id
+        )
+        self._verify_binding(
+            permission, spec, model_binding.worker_id, profile, attempt_id
+        )
+        current = self.journal.get(model_binding.worker_id)
+        remaining = permission.get("remaining_seconds")
+        if (
+            self.stop_requested.is_set()
+            or current is None
+            or current["phase"] != "dispatching"
+            or current["spec"] != row["spec"]
+            or current["binding"] != row["binding"]
+            or permission["binding"] != original["binding"]
+            or permission["requirements"] != original["requirements"]
+            or not permission["launch_allowed"]
+            or type(remaining) not in {int, float}
+            or not math.isfinite(remaining)
+            or remaining <= 0
+        ):
+            return 0
+        return min(profile.max_seconds, remaining)
+
+    def _uses_model(self, spec):
+        return (
+            self.model_broker is not None
+            and (spec.deployment_id, spec.repository, spec.profile)
+            in self.model_broker.policies
+        )
+
+    def _revoke_model(self, worker_id, spec, attempt_id):
+        if self._uses_model(spec):
+            from src.worker.model_broker import BrokerDenied
+
+            try:
+                self.model_broker.revoke_attempt(worker_id, attempt_id)
+            except BrokerDenied:
+                # A cancellation before model binding has no inference grant.
+                pass
 
     @staticmethod
     def _spec(worker: dict) -> WorkerSpec:
@@ -327,8 +387,22 @@ class ManagedDispatcher:
 
             remaining = cutoff - time.monotonic()
             allowed = allowed and remaining > 0 and not self.stop_requested.is_set()
+            if allowed and row["phase"] != "cancelling" and self._uses_model(spec):
+                from src.worker.model_broker import BrokerDenied
+
+                try:
+                    self.model_broker.bind_attempt(
+                        worker_id,
+                        spec,
+                        attempt_id,
+                        remaining,
+                        deadline_monotonic=cutoff,
+                    )
+                except BrokerDenied:
+                    allowed = False
             if not allowed or row["phase"] == "cancelling":
                 self.journal.update(worker_id, phase="cancelling")
+                self._revoke_model(worker_id, spec, attempt_id)
                 receipt = self.runtime.cancel_attempt(
                     worker_id, spec, attempt_id, bound["requirements"]
                 )
@@ -343,6 +417,9 @@ class ManagedDispatcher:
                     remaining,
                     deadline_monotonic=cutoff,
                 )
+
+            if receipt.termination_confirmed and receipt.launch_fenced:
+                self._revoke_model(worker_id, spec, attempt_id)
 
             if not (
                 receipt.termination_confirmed

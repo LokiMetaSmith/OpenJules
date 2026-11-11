@@ -13,11 +13,18 @@ preserves capture before release, and recovers delivery intents after restart.
 Source snapshots contain only the approved commit's objects; ignored host files
 and local Git configuration are excluded.
 
-This managed profile currently has no network, live model connection, delegated
-child agents or forge publication. Its real-container code-change tests establish
-execution and recovery behavior. The older webhook, in-memory collaboration and
-DinD paths described below do not satisfy this managed contract and are never
-used as a readiness fallback.
+An optional [coding agent and model broker](docs/managed-model-broker.md) connects
+that root execution to an explicitly configured provider. The broker retains
+provider credentials on the trusted host, binds requests to canonical permission
+and enforces shared call/token limits. Worker networking remains disabled.
+The default profile makes no model calls. Delegated child execution and forge
+publication remain unsupported by this managed service.
+
+CI qualifies execution, recovery and the model transport against deterministic
+provider fixtures. A configured live provider and semantic task quality require
+their own qualification. The older webhook, in-memory collaboration and DinD
+paths described below do not satisfy this managed contract and are never used
+as a readiness fallback.
 
 ---
 

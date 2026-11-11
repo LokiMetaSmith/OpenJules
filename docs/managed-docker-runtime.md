@@ -9,8 +9,10 @@ each attempt before this runtime is invoked.
 
 This is a root-only execution slice for [runtime #4](https://github.com/niklas-olsson/OpenJules/issues/4)
 and [lifecycle #3](https://github.com/niklas-olsson/OpenJules/issues/3).
-It does not implement child grants, independent review, verified PR publication,
-remote model connectivity or a hostile multi-tenant hosting service.
+Child execution, independent review, verified PR publication and hostile
+multi-tenant hosting remain outside this driver. An optional
+[host-owned model broker](managed-model-broker.md) connects approved root coding
+agents without giving their container general networking or provider credentials.
 
 ## Profile and service ownership
 
@@ -54,9 +56,11 @@ The normal task UID is 65532. UID 0 and the watchdog's reserved UID 65534 are
 rejected. `environment_refs` accepts only explicit supported model API-key
 names mapped to `env:HOST_VARIABLE`; it does not accept Docker, Git, authority,
 host path or arbitrary process environment settings. No model credentials are
-needed for deterministic qualification commands. Network mode is always `none`
-in this slice, so configuring a model key does not make a remote model reachable.
-A separately designed model connection remains necessary for live inference.
+needed for deterministic qualification commands. Network mode is always `none`,
+so configuring a guest key does not make a remote model reachable. Profiles
+configured with the host model broker reject all guest environment references;
+their provider credential stays on the host and their only added mount is the
+worker's authenticated read-only broker directory.
 
 ## Container and deadline boundary
 

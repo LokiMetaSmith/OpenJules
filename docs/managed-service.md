@@ -63,6 +63,12 @@ admission and runtime preparation time; retries cannot extend it.
 
 ## Recovery
 
+Optional `models` entries enable the [managed coding agent](managed-model-broker.md)
+for explicitly matched profiles. The service keeps provider credentials on the
+host and adds only that worker's authenticated read-only socket mount. Model
+requests require the original admitted canonical binding and its current
+permission. Profiles without this configuration remain command-only.
+
 The dispatcher persists an immutable claim request before contacting Polyphony.
 A lost reply retains that same request identity. A generic conflict or transport
 failure is not evidence that no attempt was allocated. Only the authority's
@@ -89,11 +95,12 @@ containers, inaccessible Docker and unconfirmed start intents remain unknown.
 
 ## Current supported scope
 
-This release provides an authenticated, recoverable **root command** path.
-Child delegation is unsupported. The default Docker network is disabled, so
-remote model inference is not available through this profile. A deterministic
-code-change trial proves real execution and capture, not model reasoning,
-semantic test quality, child agents, independent review or forge publication.
+This release provides an authenticated, recoverable **root execution** path,
+with an optional host-owned model broker. Child delegation is unsupported.
+The Docker network remains disabled; model traffic goes through the configured
+broker. Deterministic model and code-change trials prove transport, execution
+and capture, not live-provider behavior, model quality, child agents, independent
+review or forge publication.
 
 Durable archives, stopped containers and volumes are retained for recovery.
 There is no automatic garbage collection or per-volume disk quota. The trusted
