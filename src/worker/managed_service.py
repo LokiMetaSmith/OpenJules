@@ -1,0 +1,236 @@
+"""Single-host managed OpenJules service with an approved Docker runtime.
+
+Run: python -m src.worker.managed_service --config /private/openjules.json
+Repository code receives neither the Docker socket nor authority credentials.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from contextlib import asynccontextmanager
+import json
+from pathlib import Path
+import stat
+import threading
+
+from src.api.worker_lifecycle import create_worker_app
+from src.polyphony.managed_client import AuthorityUnavailable, ManagedAuthorityClient
+from src.worker.lifecycle import RuntimeCapabilities, WorkerLifecycle, WorkerScope
+from src.worker.managed_dispatch import ManagedDispatcher
+
+
+def _read_object(path: Path, *, private: bool = False) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("configuration must be a regular file")
+    info = path.stat()
+    if private and stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError("credential file must have mode 0600")
+    if info.st_size > 1_000_000:
+        raise ValueError("configuration file is too large")
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("configuration must be an object")
+    return data
+
+
+def load_configuration(path: str | Path):
+    config = _read_object(Path(path))
+    allowed = {
+        "schema_version",
+        "state_directory",
+        "lifecycle_database",
+        "credentials_file",
+        "authority",
+        "profiles",
+        "host",
+        "port",
+        "poll_interval_seconds",
+        "max_parallel",
+    }
+    required = {
+        "schema_version",
+        "state_directory",
+        "lifecycle_database",
+        "credentials_file",
+        "authority",
+        "profiles",
+    }
+    if not required <= set(config) or not set(config) <= allowed:
+        raise ValueError("managed service configuration fields do not match schema")
+    if type(config["schema_version"]) is not int or config["schema_version"] != 1:
+        raise ValueError("unsupported managed service configuration version")
+    for key in ("state_directory", "lifecycle_database", "credentials_file"):
+        if not isinstance(config[key], str) or not Path(config[key]).is_absolute():
+            raise ValueError("managed service paths must be absolute")
+    if config.get("host", "127.0.0.1") not in {"127.0.0.1", "::1"}:
+        raise ValueError(
+            "managed service listens on loopback; use an authenticated HTTPS proxy for remote access"
+        )
+    port = config.get("port", 8000)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("invalid managed service port")
+    authority = config["authority"]
+    if not isinstance(authority, dict) or set(authority) != {"endpoint", "token_ref"}:
+        raise ValueError("authority configuration requires endpoint and token_ref")
+    profiles = config["profiles"]
+    if (
+        not isinstance(profiles, list)
+        or not profiles
+        or not all(isinstance(p, dict) for p in profiles)
+    ):
+        raise ValueError("at least one approved runtime profile is required")
+    credentials = _read_object(Path(config["credentials_file"]), private=True)
+    scopes = {}
+    for token, grants in credentials.items():
+        if (
+            not isinstance(token, str)
+            or len(token) < 32
+            or any(c.isspace() for c in token)
+            or not isinstance(grants, list)
+            or not grants
+        ):
+            raise ValueError("invalid scoped worker credential configuration")
+        scopes[token] = []
+        for grant in grants:
+            if not isinstance(grant, dict) or set(grant) != {
+                "deployment_id",
+                "repository",
+            }:
+                raise ValueError(
+                    "worker credentials require explicit deployment/repository scopes"
+                )
+            scopes[token].append(WorkerScope(**grant))
+    if not scopes:
+        raise ValueError("explicit scoped worker credentials are required")
+    return config, scopes
+
+
+def build_app(config: dict, credentials: dict):
+    # Lazy import keeps the old lifecycle API available without constructing a
+    # Docker client. The managed entrypoint always uses the real runtime.
+    from src.worker.docker_runtime import DockerProfile, ManagedDockerRuntime
+
+    profiles = []
+    for original in config["profiles"]:
+        data = dict(original)
+        if isinstance(data.get("command"), list):
+            data["command"] = tuple(data["command"])
+        if isinstance(data.get("environment_refs", {}), dict):
+            data["environment_refs"] = tuple(
+                sorted(data.get("environment_refs", {}).items())
+            )
+        profiles.append(DockerProfile(**data))
+    profile_by_scope = {(p.deployment_id, p.repository, p.name): p for p in profiles}
+    if len(profile_by_scope) != len(profiles):
+        raise ValueError("duplicate runtime profile binding")
+    authorized_scopes = {scope for grants in credentials.values() for scope in grants}
+    if any(
+        WorkerScope(p.deployment_id, p.repository) not in authorized_scopes
+        for p in profiles
+    ):
+        raise ValueError("every profile requires an explicit ZPM credential scope")
+    authority = ManagedAuthorityClient(**config["authority"])
+    dispatcher = None
+
+    def readiness(scope, name):
+        profile = profile_by_scope.get((scope.deployment_id, scope.repository, name))
+        if profile is None:
+            return RuntimeCapabilities(
+                reason="Approved profile is unavailable in this scope"
+            )
+        if (
+            dispatcher is None
+            or not dispatcher.running.is_set()
+            or dispatcher.stop_requested.is_set()
+        ):
+            return RuntimeCapabilities(
+                profile_supported=True, reason="Managed dispatcher is not running"
+            )
+        try:
+            authority.capabilities(scope, name, profile.base_commit)
+        except AuthorityUnavailable:
+            return RuntimeCapabilities(
+                profile_supported=True,
+                reason="Canonical managed authority is unavailable",
+            )
+        # Docker/source preflight remains the runtime's responsibility.
+        return RuntimeCapabilities(
+            True,
+            True,
+            True,
+            "Canonical root dispatch is available; child delegation is unsupported",
+        )
+
+    state = Path(config["state_directory"])
+    runtime = ManagedDockerRuntime(state / "runtime", profiles, readiness)
+    lifecycle = WorkerLifecycle(config["lifecycle_database"], runtime)
+    dispatcher = ManagedDispatcher(
+        lifecycle,
+        runtime,
+        authority,
+        profiles,
+        state / "dispatcher",
+        poll_interval_seconds=config.get("poll_interval_seconds", 1),
+        max_parallel=config.get("max_parallel", 16),
+    )
+    app = create_worker_app(lifecycle, credentials)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        failed = threading.Event()
+
+        def supervise():
+            try:
+                dispatcher.run()
+            except Exception:
+                failed.set()
+
+        thread = threading.Thread(
+            target=supervise, name="managed-dispatcher", daemon=True
+        )
+        thread.start()
+        deadline = asyncio.get_running_loop().time() + 5
+        while not dispatcher.running.is_set():
+            if (
+                failed.is_set()
+                or not thread.is_alive()
+                or asyncio.get_running_loop().time() >= deadline
+            ):
+                dispatcher.stop()
+                raise RuntimeError(
+                    "Managed dispatcher could not acquire its service lock"
+                )
+            await asyncio.sleep(0.01)
+        try:
+            yield
+        finally:
+            dispatcher.stop()
+            await asyncio.to_thread(thread.join, 6)
+
+    app.router.lifespan_context = lifespan
+    app.state.managed_dispatcher = dispatcher
+    app.state.worker_lifecycle = lifecycle
+    return app
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+    try:
+        config, credentials = load_configuration(args.config)
+        app = build_app(config, credentials)
+    except (ValueError, TypeError, KeyError, OSError):
+        parser.error(
+            "managed service configuration is invalid; check schema, private files and runtime prerequisites"
+        )
+    import uvicorn
+
+    uvicorn.run(
+        app, host=config.get("host", "127.0.0.1"), port=config.get("port", 8000)
+    )
+
+
+if __name__ == "__main__":
+    main()
