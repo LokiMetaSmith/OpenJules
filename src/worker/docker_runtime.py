@@ -226,6 +226,8 @@ class ManagedDockerRuntime:
         profiles: list[DockerProfile] | tuple[DockerProfile, ...],
         readiness: Callable[[WorkerScope, str], RuntimeCapabilities],
         docker_client=None,
+        *,
+        model_broker=None,
     ):
         self.root = Path(state_directory).resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -239,6 +241,16 @@ class ManagedDockerRuntime:
                 "unique profiles and a real readiness callback are required"
             )
         self.readiness = readiness
+        self.model_broker = model_broker
+        if model_broker is not None:
+            if not set(model_broker.policies) <= set(self.profiles):
+                raise ValueError("model policies require approved runtime profiles")
+            if any(
+                self.profiles[key].environment_refs for key in model_broker.policies
+            ):
+                raise ValueError(
+                    "model-backed profiles cannot inject guest credentials"
+                )
         self._client = docker_client
         self.sources = SourceSnapshots(self.root / "sources")
         (self.root / "locks").mkdir(mode=0o700, exist_ok=True)
@@ -384,6 +396,33 @@ class ManagedDockerRuntime:
                 )
             return row
 
+    def restore_model_endpoints(self):
+        """Restore only model records belonging to unresolved owned workers."""
+        if self.model_broker is None:
+            return
+        approved = {}
+        with self._db() as db:
+            rows = db.execute("SELECT * FROM workers WHERE receipt IS NULL").fetchall()
+        for row in rows:
+            spec = WorkerSpec(**json.loads(row["spec"]))
+            key = (spec.deployment_id, spec.repository, spec.profile)
+            if key not in self.model_broker.policies:
+                continue
+            self._row(row["worker_id"], spec)  # Verify immutable runtime policy.
+            with self.model_broker.connection() as db:
+                model = db.execute(
+                    "SELECT revoked FROM workers WHERE worker_id=?", (row["worker_id"],)
+                ).fetchone()
+            if model is None:
+                if row["create_dispatched"] or row["container_id"]:
+                    raise ValueError(
+                        "model recovery journal is missing for an owned worker"
+                    )
+                continue  # Creation never reached model preparation.
+            if not model["revoked"]:
+                approved[row["worker_id"]] = spec
+        self.model_broker.restore_workers(approved)
+
     def _update(self, worker_id: str, **values):
         allowed = {
             "container_id",
@@ -404,12 +443,16 @@ class ManagedDockerRuntime:
             )
 
     def _labels(self, worker_id: str, spec: WorkerSpec) -> dict[str, str]:
-        return {
+        labels = {
             "openjules.managed": "1",
             "openjules.worker": worker_id,
             "openjules.spec": _digest(_json(asdict(spec))),
             "openjules.profile": self._profile(spec).fingerprint,
         }
+        key = (spec.deployment_id, spec.repository, spec.profile)
+        if self.model_broker is not None and key in self.model_broker.policies:
+            labels["openjules.model_policy"] = self.model_broker.policy_digests[key]
+        return labels
 
     def _name(self, worker_id: str) -> str:
         return "openjules-worker-" + _digest(worker_id)[:40]
@@ -462,6 +505,14 @@ class ManagedDockerRuntime:
         volume.reload()
         if any(volume.attrs.get("Labels", {}).get(k) != v for k, v in labels.items()):
             raise LifecycleConflict("workspace volume ownership mismatch")
+        volumes = {
+            str(source): {"bind": "/source", "mode": "ro"},
+            volume_name: {"bind": "/workspace", "mode": "rw"},
+        }
+        key = (spec.deployment_id, spec.repository, spec.profile)
+        if self.model_broker is not None and key in self.model_broker.policies:
+            directory = self.model_broker.prepare_worker(worker_id, spec)
+            volumes[str(directory)] = {"bind": "/run/openjules-model", "mode": "ro"}
         self._update(worker_id, create_dispatched=1)
         return self.client.containers.create(
             profile.image,
@@ -482,10 +533,7 @@ class ManagedDockerRuntime:
             cpu_period=100000,
             cpu_quota=profile.cpu_quota,
             pids_limit=profile.pids_limit,
-            volumes={
-                str(source): {"bind": "/source", "mode": "ro"},
-                volume_name: {"bind": "/workspace", "mode": "rw"},
-            },
+            volumes=volumes,
             tmpfs={
                 "/tmp": f"rw,noexec,nosuid,nodev,size=16777216,mode=1777",
                 "/control": f"rw,noexec,nosuid,nodev,size=65536,uid={_WATCHDOG_UID},gid={_WATCHDOG_UID},mode=0700",

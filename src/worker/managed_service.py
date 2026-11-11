@@ -10,6 +10,7 @@ import argparse
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import os
 from pathlib import Path
 import stat
 import threading
@@ -47,6 +48,7 @@ def load_configuration(path: str | Path):
         "port",
         "poll_interval_seconds",
         "max_parallel",
+        "models",
     }
     required = {
         "schema_version",
@@ -132,6 +134,46 @@ def build_app(config: dict, credentials: dict):
         raise ValueError("every profile requires an explicit ZPM credential scope")
     authority = ManagedAuthorityClient(**config["authority"])
     dispatcher = None
+    model_broker = None
+    models = config.get("models", [])
+    if not isinstance(models, list) or len(models) > len(profiles):
+        raise ValueError("models must be a bounded list of approved profile policies")
+    model_policies = {}
+    if models:
+        from src.worker.model_broker import ModelBroker, ModelPolicy
+
+        for item in models:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"deployment_id", "repository", "profile", "policy"}
+                or not isinstance(item["policy"], dict)
+            ):
+                raise ValueError(
+                    "model policies require an exact approved profile scope"
+                )
+            key = (item["deployment_id"], item["repository"], item["profile"])
+            if key not in profile_by_scope or key in model_policies:
+                raise ValueError("duplicate or unsupported model profile")
+            if profile_by_scope[key].environment_refs:
+                raise ValueError(
+                    "model-backed profiles cannot inject guest credentials"
+                )
+            model_policies[key] = ModelPolicy(**item["policy"])
+
+        def model_permission(binding):
+            return 0 if dispatcher is None else dispatcher.model_permission(binding)
+
+        model_broker = ModelBroker(
+            Path(config["state_directory"]) / "models",
+            model_policies,
+            model_permission,
+            peer_uids={key: profile_by_scope[key].uid for key in model_policies},
+        )
+        try:
+            model_broker.check_ready()
+        except BaseException:
+            model_broker.close()
+            raise
 
     def readiness(scope, name):
         profile = profile_by_scope.get((scope.deployment_id, scope.repository, name))
@@ -154,6 +196,21 @@ def build_app(config: dict, credentials: dict):
                 profile_supported=True,
                 reason="Canonical managed authority is unavailable",
             )
+        model_key = (scope.deployment_id, scope.repository, name)
+        if model_key in model_policies:
+            token = os.environ.get(model_policies[model_key].token_ref[4:])
+            if not token or any(character.isspace() for character in token):
+                return RuntimeCapabilities(
+                    profile_supported=True,
+                    reason="Configured model credential is unavailable",
+                )
+            try:
+                model_broker.check_ready()
+            except Exception:
+                return RuntimeCapabilities(
+                    profile_supported=True,
+                    reason="Managed model transport is unavailable",
+                )
         # Docker/source preflight remains the runtime's responsibility.
         return RuntimeCapabilities(
             True,
@@ -163,21 +220,36 @@ def build_app(config: dict, credentials: dict):
         )
 
     state = Path(config["state_directory"])
-    runtime = ManagedDockerRuntime(state / "runtime", profiles, readiness)
-    lifecycle = WorkerLifecycle(config["lifecycle_database"], runtime)
-    dispatcher = ManagedDispatcher(
-        lifecycle,
-        runtime,
-        authority,
-        profiles,
-        state / "dispatcher",
-        poll_interval_seconds=config.get("poll_interval_seconds", 1),
-        max_parallel=config.get("max_parallel", 16),
-    )
-    app = create_worker_app(lifecycle, credentials)
+    try:
+        runtime = ManagedDockerRuntime(
+            state / "runtime", profiles, readiness, model_broker=model_broker
+        )
+        lifecycle = WorkerLifecycle(config["lifecycle_database"], runtime)
+        dispatcher = ManagedDispatcher(
+            lifecycle,
+            runtime,
+            authority,
+            profiles,
+            state / "dispatcher",
+            poll_interval_seconds=config.get("poll_interval_seconds", 1),
+            max_parallel=config.get("max_parallel", 16),
+            model_broker=model_broker,
+        )
+        app = create_worker_app(lifecycle, credentials)
+    except BaseException:
+        if model_broker is not None:
+            model_broker.close()
+        raise
 
     @asynccontextmanager
     async def lifespan(_app):
+        if model_broker is not None:
+            try:
+                runtime.restore_model_endpoints()
+                model_broker.check_ready()
+            except BaseException:
+                model_broker.close()
+                raise
         failed = threading.Event()
 
         def supervise():
@@ -198,6 +270,8 @@ def build_app(config: dict, credentials: dict):
                 or asyncio.get_running_loop().time() >= deadline
             ):
                 dispatcher.stop()
+                if model_broker is not None:
+                    model_broker.close()
                 raise RuntimeError(
                     "Managed dispatcher could not acquire its service lock"
                 )
@@ -207,10 +281,13 @@ def build_app(config: dict, credentials: dict):
         finally:
             dispatcher.stop()
             await asyncio.to_thread(thread.join, 6)
+            if model_broker is not None:
+                await asyncio.to_thread(model_broker.close)
 
     app.router.lifespan_context = lifespan
     app.state.managed_dispatcher = dispatcher
     app.state.worker_lifecycle = lifecycle
+    app.state.model_broker = model_broker
     return app
 
 
