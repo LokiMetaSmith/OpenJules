@@ -56,8 +56,36 @@ async function pollState() {
       const polyData = await polyRes.json();
       renderPolyphony(polyData);
     }
+    fetchCohortTelemetry();
   } catch (err) {
     console.debug("Poll error", err);
+  }
+}
+
+async function fetchCohortTelemetry() {
+  try {
+    const res = await fetch("/api/polyphony/cohorts");
+    if (!res.ok) return;
+    const cohorts = await res.json();
+    const workerEl = document.getElementById("cohort-workers-stat");
+    const budgetEl = document.getElementById("cohort-budget-stat");
+
+    if (cohorts.length === 0) {
+      if (workerEl) workerEl.innerText = "0 Active (0 Burst)";
+      if (budgetEl) budgetEl.innerText = "$0.00 / $100.00";
+      return;
+    }
+
+    const c = cohorts[0];
+    const burstCount = Math.max(0, c.active_worker_count - c.base_worker_count);
+    if (workerEl) {
+      workerEl.innerText = `${c.active_worker_count} Active (${burstCount} Burst / Cap: ${c.max_burst_workers})`;
+    }
+    if (budgetEl) {
+      budgetEl.innerText = `$${(c.internal_metered_cost || 0).toFixed(2)} spent`;
+    }
+  } catch (err) {
+    console.debug("Error fetching cohort telemetry", err);
   }
 }
 
