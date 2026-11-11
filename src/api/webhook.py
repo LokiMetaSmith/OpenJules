@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from src.api.polyphony_routes import polyphony_router
 from src.api.ui_routes import record_ui_task, ui_router
 from src.api.ws import ws_manager, ws_router
 from src.worker.dispatcher import BackgroundTasksDispatcher, TaskDispatcher, TaskPayload
@@ -31,9 +32,10 @@ app = FastAPI(
 
 executor = TaskExecutor()
 
-# Include dashboard and UI endpoints
+# Include dashboard, UI, and Polyphony endpoints
 app.include_router(ui_router)
 app.include_router(ws_router)
+app.include_router(polyphony_router)
 
 # Mount static files
 static_dir = Path(__file__).parent.parent / "ui" / "static"

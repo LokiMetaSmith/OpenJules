@@ -229,6 +229,50 @@ print('CHILD_IDENTITY_VERIFIED uid='+str(os.getuid()))
 """
 
 
+SIBLING_VERIFY = """import json,os,pathlib,socket,struct,sys
+own,others=json.loads(sys.argv[1])
+assert os.getuid()==own['uid'] and os.getgid()==own['uid']
+for name in own['files']:
+    assert pathlib.Path(name).read_bytes(), name
+def denied(action,label):
+    try:
+        action()
+    except PermissionError:
+        return
+    raise AssertionError('private child access was permitted: '+label)
+def receive(connection,size):
+    data=b''
+    while len(data)<size:
+        part=connection.recv(size-len(data))
+        assert part, 'socket closed without an authenticated refusal'
+        data+=part
+    return data
+def probe_socket(path,own_socket=False):
+    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
+        connection.connect(path)
+        if own_socket:
+            # Authentication precedes frame validation. No inference is asked
+            # for: this positive control must reach invalid_request, not denial.
+            connection.sendall(struct.pack('!I',0))
+        length=struct.unpack('!I',receive(connection,4))[0]
+        assert 0<length<=4096
+        reply=json.loads(receive(connection,length))
+        assert reply['ok'] is False
+        assert reply['error']==('invalid_request' if own_socket else 'not_authorized'), reply
+probe_socket(own['socket'],True)
+for other in others:
+    denied(lambda: list(pathlib.Path(other['directory']).iterdir()),other['directory'])
+    for name in other['files']:
+        denied(lambda: pathlib.Path(name).read_bytes(),'read '+name)
+        denied(lambda: pathlib.Path(name).open('ab'),'write '+name)
+    denied(lambda: os.chmod(other['directory'],0o777),'chmod '+other['directory'])
+    denied(lambda: os.setuid(other['uid']),'setuid '+str(other['uid']))
+    probe_socket(other['socket'])
+print(json.dumps({'uid':os.getuid(),'denied_uids':[item['uid'] for item in others]}))
+"""
+
+
 def make_source(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -607,6 +651,139 @@ def test_two_real_children_use_unique_uids_share_allowance_and_compose_root(
                 == stack.policy.fingerprint
             )
             assert container.attrs["HostConfig"]["CapDrop"] == ["ALL"]
+
+
+def test_real_siblings_and_root_cannot_read_private_artifacts_or_use_other_sockets(
+    tmp_path, monkeypatch, agent_image
+):
+    turns = {"left": 0, "right": 0}
+
+    def deterministic(handler, requests):
+        initial = requests[-1]["body"]["messages"][1]["content"]
+        name = "left" if initial.startswith("CHILD_left") else "right"
+        assert initial.startswith("CHILD_" + name)
+        turns[name] += 1
+        assert turns[name] <= 2
+        answer = (
+            message("write_file", path=name + ".txt", content=name + " private\n")
+            if turns[name] == 1
+            else message("finish", summary="Retain private " + name + " artifacts")
+        )
+        response(handler, answer)
+
+    with provider(deterministic) as (endpoint, requests):
+        with child_stack(
+            tmp_path, monkeypatch, agent_image, endpoint, sleeping_root=True
+        ) as stack:
+            stack.dispatcher.tick_worker(stack.worker)
+            root = stack.children.journal.context(stack.worker_id)
+            children = []
+            for name in turns:
+                result = stack.children.handle(
+                    stack.worker_id,
+                    {
+                        "schema_version": 1,
+                        "request_id": "isolation-" + name,
+                        "operation": "spawn",
+                        "instructions": "CHILD_" + name + ": edit " + name + ".txt",
+                        "seconds": 35,
+                        "max_turns": 3,
+                        "capabilities": ["python"],
+                    },
+                )
+                children.append(result["child_id"])
+            until = time.monotonic() + 20
+            while time.monotonic() < until:
+                records = [
+                    stack.children.driver.observe(
+                        root, stack.children.journal.child(stack.worker_id, child_id)
+                    )
+                    for child_id in children
+                ]
+                if all(child["phase"] == "exec_returned" for child in records):
+                    break
+                time.sleep(0.05)
+            assert {child["phase"] for child in records} == {"exec_returned"}
+            assert {child["uid"] for child in records} == {60000, 60001}
+            assert turns == {"left": 2, "right": 2} and len(requests) == 4
+            assert not any(child["capture"] for child in records)
+
+            # An exec return is provisional. The production model endpoints,
+            # container and all three execution references are still live.
+            container = stack.client.containers.get(
+                stack.runtime._name(stack.worker_id)
+            )
+            container.reload()
+            assert container.attrs["State"]["Running"] is True
+            assert len(
+                stack.lifecycle.observe_worker(stack.spec.scope, stack.worker_id)[
+                    "active_executions"
+                ]
+            ) == 3
+            contexts = []
+            for name, child in zip(turns, records):
+                directory = "/workspace/children/" + child["child_id"]
+                contexts.append(
+                    {
+                        "uid": child["uid"],
+                        "directory": directory,
+                        "files": [
+                            directory + "/input.txt",
+                            directory + "/run/repo/" + name + ".txt",
+                            directory + "/run/change.patch",
+                            directory + "/run/output.log",
+                        ],
+                        "socket": "/run/openjules-model/children/"
+                        + child["child_id"]
+                        + "/model.sock",
+                    }
+                )
+            root_context = {
+                "uid": stack.profile.uid,
+                "files": ["/workspace/run/repo/left.txt"],
+                "socket": "/run/openjules-model/model.sock",
+            }
+            for own, others in (
+                (contexts[0], [contexts[1]]),
+                (contexts[1], [contexts[0]]),
+                (root_context, contexts),
+            ):
+                checked = container.exec_run(
+                    ["python3", "-I", "-c", SIBLING_VERIFY, json.dumps([own, others])],
+                    user=f"{own['uid']}:{own['uid']}",
+                    workdir="/",
+                    privileged=False,
+                )
+                assert checked.exit_code == 0, checked.output.decode(errors="replace")
+                assert json.loads(checked.output) == {
+                    "uid": own["uid"],
+                    "denied_uids": [other["uid"] for other in others],
+                }
+            assert len(requests) == len(stack.child_authority.turns) == 4
+            with stack.broker.connection() as db:
+                reserved = db.execute(
+                    "SELECT COUNT(*),SUM(reserved_tokens) FROM calls"
+                ).fetchone()
+                assert tuple(reserved) == (4, 4 * 2048)
+
+            stack.children.handle(
+                stack.worker_id,
+                {
+                    "schema_version": 1,
+                    "request_id": "finish-isolation",
+                    "operation": "cancel",
+                    "child_id": children[0],
+                    "reason": "Isolation probes complete; fence and capture the worker",
+                },
+            )
+            wait_complete(stack)
+            for name, child_id in zip(turns, children):
+                child = stack.children.journal.child(stack.worker_id, child_id)
+                assert child["phase"] == "completed"
+                captured = json.loads(child["capture"])["contents"]
+                assert "+" + name + " private" in captured["patch"]
+                assert "CHILD_IDENTITY_VERIFIED" in captured["log"]
+            assert len(requests) == 4
 
 
 def test_earliest_child_watchdog_survives_host_shutdown_and_exec_return(
