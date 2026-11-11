@@ -134,7 +134,7 @@ class ModelBinding:
         return self.spec.scope
 
 
-def _tool_call(value):
+def _tool_call(value, tools=None):
     if (
         not isinstance(value, dict)
         or set(value) != {"id", "type", "function"}
@@ -147,7 +147,7 @@ def _tool_call(value):
         or not _IDENTIFIER.fullmatch(value["id"])
         or not isinstance(function, dict)
         or set(function) != {"name", "arguments"}
-        or function["name"] not in _TOOLS
+        or function["name"] not in (_TOOLS if tools is None else tools)
         or not isinstance(function["arguments"], str)
         or len(function["arguments"].encode()) > 150000
     ):
@@ -155,7 +155,7 @@ def _tool_call(value):
     return value
 
 
-def _messages(value):
+def _messages(value, tools=None):
     if not isinstance(value, list) or not 1 <= len(value) <= 256:
         raise BrokerDenied("invalid_request")
     for message in value:
@@ -189,18 +189,18 @@ def _messages(value):
         if not isinstance(calls, list) or len(calls) > 8:
             raise BrokerDenied("invalid_request")
         for call in calls:
-            _tool_call(call)
+            _tool_call(call, tools)
     return value
 
 
-def _assistant(value):
+def _assistant(value, tools=None):
     if not isinstance(value, dict) or value.get("role") != "assistant":
         raise BrokerDenied("provider_unavailable")
     result = {"role": "assistant", "content": value.get("content")}
     if value.get("tool_calls"):
         result["tool_calls"] = value["tool_calls"]
     try:
-        _messages([result])
+        _messages([result], tools)
     except BrokerDenied:
         raise BrokerDenied("provider_unavailable") from None
     return result
@@ -354,6 +354,8 @@ class ModelBroker:
         self.database = self.root / "inference.sqlite3"
         self.guard = threading.RLock()
         self.endpoints = {}
+        self.inference_locks = {}
+        self.child_supervisor = None
         self.closed = False
         self._service_lock = (self.root / "service.lock").open("a")
         try:
@@ -647,6 +649,55 @@ class ModelBroker:
         return row, policy, deadline
 
     def complete(self, worker_id: str, payload: dict) -> dict:
+        return self._serialized_complete(worker_id, payload)
+
+    def complete_child(self, worker_id: str, child_id: str, payload: dict) -> dict:
+        if self.child_supervisor is None:
+            raise BrokerDenied("not_authorized")
+        return self._serialized_complete(worker_id, payload, child_id)
+
+    def _serialized_complete(self, worker_id, payload, child_id=None):
+        # A known live call is busy, not a lost provider outcome. No journal or
+        # canonical turn effects occur before this common root/child gate.
+        with self.connection() as db:
+            self._worker(db, worker_id)
+        with self.guard:
+            gate = self.inference_locks.setdefault(worker_id, threading.Lock())
+        if not gate.acquire(timeout=0.05):
+            raise BrokerDenied("retry_later")
+        try:
+            return self._complete_serial(worker_id, payload, child_id)
+        finally:
+            gate.release()
+
+    def _context_permission(self, worker_id, child_id=None):
+        row, policy, deadline = self._authorized(worker_id)
+        if child_id is not None:
+            from .child_supervisor import ChildDenied
+
+            try:
+                deadline = min(
+                    deadline, self.child_supervisor.permission(worker_id, child_id)
+                )
+            except Exception:
+                raise BrokerDenied("not_authorized") from None
+            # Child authority transport can outlive root cancellation too.
+            current, _, root_deadline = self._authorized(worker_id)
+            if current["attempt_id"] != row["attempt_id"]:
+                raise BrokerDenied("not_authorized")
+            try:
+                deadline = min(
+                    deadline,
+                    root_deadline,
+                    self.child_supervisor.local_cutoff(worker_id, child_id),
+                )
+            except ChildDenied:
+                raise BrokerDenied("not_authorized") from None
+        if deadline <= time.monotonic():
+            raise BrokerDenied("not_authorized")
+        return row, policy, deadline
+
+    def _complete_serial(self, worker_id: str, payload: dict, child_id=None) -> dict:
         if (
             not isinstance(payload, dict)
             or set(payload) != {"schema_version", "request_id", "messages"}
@@ -656,13 +707,28 @@ class ModelBroker:
             or not _IDENTIFIER.fullmatch(payload["request_id"])
         ):
             raise BrokerDenied("invalid_request")
-        _messages(payload["messages"])
-        row, policy, deadline = self._authorized(worker_id)
+        definitions = TOOL_DEFINITIONS
+        if child_id is None and self.child_supervisor is not None:
+            with self.connection() as db:
+                spec = WorkerSpec(**json.loads(self._worker(db, worker_id)["spec"]))
+            if self.child_supervisor.enabled(spec):
+                from src.agent.child_tools import CHILD_TOOL_DEFINITIONS
+
+                definitions = [*TOOL_DEFINITIONS, *CHILD_TOOL_DEFINITIONS]
+        tool_names = {item["function"]["name"] for item in definitions}
+        _messages(payload["messages"], tool_names)
+        row, policy, deadline = self._context_permission(worker_id, child_id)
         normalized = _json(payload)
         if len(normalized.encode()) > policy.max_request_bytes:
             raise BrokerDenied("invalid_request")
-        identity = (worker_id, row["attempt_id"], payload["request_id"])
+        stored_id = (
+            payload["request_id"]
+            if child_id is None
+            else "/child/" + _hash(_json([child_id, payload["request_id"]]))
+        )
+        identity = (worker_id, row["attempt_id"], stored_id)
         digest = _hash(normalized)
+        cached = None
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             current = self._worker(db, worker_id)
@@ -679,34 +745,88 @@ class ModelBroker:
             if prior:
                 if prior["payload_hash"] != digest:
                     raise BrokerDenied("conflict")
-                if prior["status"] != "complete":
+                if prior["status"] == "complete":
+                    cached = json.loads(prior["response"])
+                elif child_id is None or prior["status"] != "child_authorizing":
                     raise BrokerDenied("uncertain")
-                return json.loads(prior["response"])
-            if db.execute(
-                "SELECT 1 FROM calls WHERE worker_id=? AND attempt_id=? AND status!='complete'",
-                identity[:2],
-            ).fetchone():
-                raise BrokerDenied("uncertain")
-            count, reserved = db.execute(
-                "SELECT COUNT(*),COALESCE(SUM(reserved_tokens),0) FROM calls WHERE worker_id=? AND attempt_id=?",
-                identity[:2],
-            ).fetchone()
-            available = policy.max_total_output_tokens - reserved
-            if count >= policy.max_calls or available <= 0:
-                raise BrokerDenied("budget_exhausted")
-            tokens = min(policy.max_output_tokens, available)
-            db.execute(
-                "INSERT INTO calls VALUES(?,?,?,?,?,'reserved',NULL)",
-                (*identity, digest, tokens),
-            )
+                tokens = prior["reserved_tokens"]
+            else:
+                pending = db.execute(
+                    "SELECT status FROM calls WHERE worker_id=? AND attempt_id=? AND status!='complete'",
+                    identity[:2],
+                ).fetchall()
+                if pending:
+                    # Another child may still be resolving only its canonical
+                    # turn. It has not dispatched a provider request, so peers
+                    # wait without creating another reservation or exiting.
+                    if all(item["status"] == "child_authorizing" for item in pending):
+                        raise BrokerDenied("retry_later")
+                    raise BrokerDenied("uncertain")
+                count, reserved = db.execute(
+                    "SELECT COUNT(*),COALESCE(SUM(reserved_tokens),0) FROM calls WHERE worker_id=? AND attempt_id=?",
+                    identity[:2],
+                ).fetchone()
+                available = policy.max_total_output_tokens - reserved
+                if count >= policy.max_calls or available <= 0:
+                    raise BrokerDenied("budget_exhausted")
+                tokens = min(policy.max_output_tokens, available)
+                db.execute(
+                    "INSERT INTO calls VALUES(?,?,?,?,?,?,NULL)",
+                    (
+                        *identity,
+                        digest,
+                        tokens,
+                        "child_authorizing" if child_id is not None else "reserved",
+                    ),
+                )
+        if cached is not None:
+            self._context_permission(worker_id, child_id)
+            return cached
+        if child_id is not None:
+            from .child_supervisor import ChildDenied
+            from src.polyphony.child_client import ChildRejected
+            from src.polyphony.managed_client import AuthorityUnavailable
+
+            try:
+                turn_deadline = self.child_supervisor.reserve_turn(
+                    worker_id, child_id, payload["request_id"], digest
+                )
+                deadline = min(deadline, turn_deadline)
+                self._context_permission(worker_id, child_id)
+            except (ChildDenied, ChildRejected, BrokerDenied):
+                denied = {
+                    "schema_version": 1,
+                    "request_id": payload["request_id"],
+                    "ok": False,
+                    "error": "not_authorized",
+                }
+                with self.connection() as db:
+                    db.execute(
+                        "UPDATE calls SET status='complete',response=? WHERE worker_id=? AND attempt_id=? AND request_id=? AND status='child_authorizing'",
+                        (_json(denied), *identity),
+                    )
+                raise BrokerDenied("not_authorized") from None
+            except AuthorityUnavailable:
+                # Only the canonical turn reservation may repeat at this phase.
+                raise BrokerDenied("canonical_pending") from None
+            with self.connection() as db:
+                db.execute(
+                    "UPDATE calls SET status='reserved' WHERE worker_id=? AND attempt_id=? AND request_id=? AND status='child_authorizing'",
+                    identity,
+                )
         try:
             # Reserving the durable budget may wait on a database writer. Do
             # not dispatch using permission sampled before that wait.
-            _, _, current_deadline = self._authorized(worker_id)
+            _, _, current_deadline = self._context_permission(worker_id, child_id)
             deadline = min(deadline, current_deadline)
-            response = asyncio.run(
+            forward = (
                 self._forward(policy, payload["messages"], tokens, deadline)
+                if definitions is TOOL_DEFINITIONS
+                else self._forward(
+                    policy, payload["messages"], tokens, deadline, definitions
+                )
             )
+            response = asyncio.run(forward)
             result = {
                 "schema_version": 1,
                 "request_id": payload["request_id"],
@@ -720,7 +840,7 @@ class ModelBroker:
                 )
             # Revocation can race an already dispatched inference call. Its
             # budget stays charged, but it grants no fresh permission or output.
-            self._authorized(worker_id)
+            self._context_permission(worker_id, child_id)
             return result
         except BrokerDenied:
             with self.connection() as db:
@@ -737,7 +857,7 @@ class ModelBroker:
                 )
             raise BrokerDenied("uncertain") from None
 
-    async def _forward(self, policy, messages, tokens, deadline):
+    async def _forward(self, policy, messages, tokens, deadline, definitions=None):
         token = os.environ.get(policy.token_ref[4:], "")
         if not token or any(c.isspace() for c in token):
             raise BrokerDenied("provider_unavailable")
@@ -747,7 +867,7 @@ class ModelBroker:
         body = {
             "model": policy.model,
             "messages": messages,
-            "tools": TOOL_DEFINITIONS,
+            "tools": TOOL_DEFINITIONS if definitions is None else definitions,
             "tool_choice": "auto",
             "stream": False,
             policy.token_parameter: tokens,
@@ -783,7 +903,12 @@ class ModelBroker:
                 or not isinstance(choices[0], dict)
             ):
                 raise BrokerDenied("provider_unavailable")
-            return _assistant(choices[0].get("message"))
+            allowed_tools = (
+                None
+                if definitions is None
+                else {item["function"]["name"] for item in definitions}
+            )
+            return _assistant(choices[0].get("message"), allowed_tools)
         except BrokerDenied:
             raise
         except Exception:

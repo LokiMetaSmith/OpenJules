@@ -50,10 +50,8 @@ def agent_image(tmp_path_factory):
         repository = Path(__file__).parents[2]
         build = tmp_path_factory.mktemp("agent-image")
         (build / "src/agent").mkdir(parents=True)
-        shutil.copyfile(
-            repository / "src/agent/managed_runner.py",
-            build / "src/agent/managed_runner.py",
-        )
+        for name in ("managed_runner.py", "managed_root_runner.py", "child_tools.py"):
+            shutil.copyfile(repository / "src/agent" / name, build / "src/agent" / name)
         shutil.copyfile(
             repository / "docker/Dockerfile.managed-agent", build / "Dockerfile"
         )

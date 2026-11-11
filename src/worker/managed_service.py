@@ -49,6 +49,7 @@ def load_configuration(path: str | Path):
         "poll_interval_seconds",
         "max_parallel",
         "models",
+        "children",
     }
     required = {
         "schema_version",
@@ -135,6 +136,7 @@ def build_app(config: dict, credentials: dict):
     authority = ManagedAuthorityClient(**config["authority"])
     dispatcher = None
     model_broker = None
+    child_supervisor = None
     models = config.get("models", [])
     if not isinstance(models, list) or len(models) > len(profiles):
         raise ValueError("models must be a bounded list of approved profile policies")
@@ -175,6 +177,41 @@ def build_app(config: dict, credentials: dict):
             model_broker.close()
             raise
 
+    child_policies = {}
+    try:
+        configured_children = config.get("children", [])
+        if not isinstance(configured_children, list) or len(configured_children) > len(
+            profiles
+        ):
+            raise ValueError(
+                "children must be a bounded list of approved profile policies"
+            )
+        if configured_children:
+            from src.worker.child_types import ChildPolicy
+
+            for item in configured_children:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"deployment_id", "repository", "profile", "policy"}
+                    or not isinstance(item["policy"], dict)
+                ):
+                    raise ValueError(
+                        "child policies require an exact approved profile scope"
+                    )
+                key = (item["deployment_id"], item["repository"], item["profile"])
+                if key not in model_policies or key in child_policies:
+                    raise ValueError(
+                        "children require a unique approved model-backed profile"
+                    )
+                child_policies[key] = ChildPolicy(**item["policy"])
+                child_policies[key].validate_root(
+                    profile_by_scope[key].uid, profile_by_scope[key].max_seconds
+                )
+    except BaseException:
+        if model_broker is not None:
+            model_broker.close()
+        raise
+
     def readiness(scope, name):
         profile = profile_by_scope.get((scope.deployment_id, scope.repository, name))
         if profile is None:
@@ -190,7 +227,14 @@ def build_app(config: dict, credentials: dict):
                 profile_supported=True, reason="Managed dispatcher is not running"
             )
         try:
-            authority.capabilities(scope, name, profile.base_commit)
+            canonical_capabilities = authority.capabilities(
+                scope, name, profile.base_commit
+            )
+            child_policy = child_policies.get(
+                (scope.deployment_id, scope.repository, name)
+            )
+            if child_policy is not None:
+                child_policy.validate_capabilities(canonical_capabilities)
         except AuthorityUnavailable:
             return RuntimeCapabilities(
                 profile_supported=True,
@@ -216,15 +260,55 @@ def build_app(config: dict, credentials: dict):
             True,
             True,
             True,
-            "Canonical root dispatch is available; child delegation is unsupported",
+            (
+                "Canonical root and bounded child dispatch are available"
+                if model_key in child_policies
+                else "Canonical root dispatch is available; child delegation is unsupported"
+            ),
         )
 
     state = Path(config["state_directory"])
     try:
         runtime = ManagedDockerRuntime(
-            state / "runtime", profiles, readiness, model_broker=model_broker
+            state / "runtime",
+            profiles,
+            readiness,
+            model_broker=model_broker,
+            **({"child_policies": child_policies} if child_policies else {}),
         )
         lifecycle = WorkerLifecycle(config["lifecycle_database"], runtime)
+        if child_policies:
+            from src.worker.child_supervisor import ChildSupervisor
+            from src.worker.child_broker import ChildBroker
+            from src.worker.model_broker import ModelBinding
+
+            def child_root_permission(context):
+                return (
+                    0
+                    if dispatcher is None
+                    else dispatcher.model_permission(
+                        ModelBinding(
+                            context.worker_id, context.attempt_id, context.spec
+                        )
+                    )
+                )
+
+            def child_root_active(context):
+                return dispatcher is not None and dispatcher.child_root_active(context)
+
+            child_supervisor = ChildSupervisor(
+                state / "children",
+                child_policies,
+                authority,
+                lifecycle,
+                runtime,
+                model_broker,
+                child_root_permission,
+                child_root_active,
+            )
+            child_supervisor.endpoints = ChildBroker(child_supervisor, model_broker)
+            runtime.child_supervisor = child_supervisor
+            model_broker.child_supervisor = child_supervisor
         dispatcher = ManagedDispatcher(
             lifecycle,
             runtime,
@@ -234,9 +318,16 @@ def build_app(config: dict, credentials: dict):
             poll_interval_seconds=config.get("poll_interval_seconds", 1),
             max_parallel=config.get("max_parallel", 16),
             model_broker=model_broker,
+            **(
+                {"child_supervisor": child_supervisor}
+                if child_supervisor is not None
+                else {}
+            ),
         )
         app = create_worker_app(lifecycle, credentials)
     except BaseException:
+        if child_supervisor is not None:
+            child_supervisor.close()
         if model_broker is not None:
             model_broker.close()
         raise
@@ -248,6 +339,8 @@ def build_app(config: dict, credentials: dict):
                 runtime.restore_model_endpoints()
                 model_broker.check_ready()
             except BaseException:
+                if child_supervisor is not None:
+                    child_supervisor.close()
                 model_broker.close()
                 raise
         failed = threading.Event()
@@ -270,6 +363,8 @@ def build_app(config: dict, credentials: dict):
                 or asyncio.get_running_loop().time() >= deadline
             ):
                 dispatcher.stop()
+                if child_supervisor is not None:
+                    child_supervisor.close()
                 if model_broker is not None:
                     model_broker.close()
                 raise RuntimeError(
@@ -281,6 +376,8 @@ def build_app(config: dict, credentials: dict):
         finally:
             dispatcher.stop()
             await asyncio.to_thread(thread.join, 6)
+            if child_supervisor is not None:
+                await asyncio.to_thread(child_supervisor.close)
             if model_broker is not None:
                 await asyncio.to_thread(model_broker.close)
 
@@ -288,6 +385,7 @@ def build_app(config: dict, credentials: dict):
     app.state.managed_dispatcher = dispatcher
     app.state.worker_lifecycle = lifecycle
     app.state.model_broker = model_broker
+    app.state.child_supervisor = child_supervisor
     return app
 
 

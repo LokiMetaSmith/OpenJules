@@ -265,10 +265,11 @@ configured provider behavior and a real coding task.
 
 ## Remaining boundaries
 
-This is a root-agent interface. It cannot create child agents, child identities
-or delegated budgets. Child execution needs canonical grants, separate runtime
-admission and verified child capture. A child-supplied identifier in the root
-protocol is insufficient.
+The completion protocol cannot create child identities or delegated budgets.
+Opt-in [bounded child execution](managed-children.md) adds a separate root-only
+control socket, canonical grants, distinct kernel-checked child UIDs and a final
+capture barrier. Every child completion uses the same root allowance. A
+child-supplied identifier in a completion request does not select its identity.
 
 The broker does not address the Docker runtime's separate disk quota, retained
 container/volume cleanup or ambiguous initial-start recovery limitations. It
