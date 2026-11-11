@@ -87,6 +87,20 @@ repository code runs. Docker receives the original immutable execution identity.
 Its durable intent and tombstones prevent replay after a lost response. Unknown
 execution, uncertain Docker start and failed capture retain reservations.
 
+A drain or stop response can acknowledge durable intent while another runtime
+operation still holds the worker lock. Local admission closes immediately. A
+`draining` snapshot does not by itself prove that the runtime or canonical child
+authority received the closure. The snapshot reason identifies control intents
+that still await runtime confirmation.
+
+The trusted dispatcher reconciles at most one incomplete control per worker in
+each pass, reusing the original scoped request key and immutable payload. It
+does this even when all execution slots are occupied. An explicit stop takes
+priority over pending drains. Confirmed terminal evidence completes an intent
+without signaling the runtime again; uncertain delivery remains durable across
+restart. Drain preserves existing root and child grants while closing new
+admission. Ordinary observation and discovery remain read-only.
+
 After termination, the dispatcher delivers immutable patch, log and manifest
 content to Polyphony and verifies the returned content hashes. Only a complete
 terminal receipt allows the local execution reference to clear. A successful
