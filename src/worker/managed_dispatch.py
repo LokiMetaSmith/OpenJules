@@ -590,8 +590,6 @@ class ManagedDispatcher:
                         if thread.is_alive()
                     }
                     for deployment_id, repository in scopes:
-                        if len(threads) >= self.max_parallel:
-                            break
                         try:
                             workers = self.lifecycle.discover_workers(
                                 WorkerScope(deployment_id, repository)
@@ -602,15 +600,28 @@ class ManagedDispatcher:
                         for worker in workers:
                             worker_id = worker["worker_id"]
                             if (
-                                worker_id in threads
-                                or len(threads) >= self.max_parallel
-                            ):
-                                continue
-                            if (
                                 worker["deployment_id"],
                                 worker["repository"],
                                 worker["profile"],
                             ) not in self.profiles:
+                                continue
+                            try:
+                                # Control delivery must continue while root
+                                # executions occupy every dispatcher slot. A
+                                # successful HTTP response can acknowledge an
+                                # intent that could not yet acquire its lock.
+                                worker = self.lifecycle.reconcile_control(
+                                    WorkerScope(deployment_id, repository), worker_id
+                                )
+                            except Exception:
+                                logger.info(
+                                    "Managed control intent awaits runtime reconciliation"
+                                )
+                                continue
+                            if (
+                                worker_id in threads
+                                or len(threads) >= self.max_parallel
+                            ):
                                 continue
                             row = self.journal.get(worker_id)
                             if row and row["phase"] == "completed":

@@ -236,6 +236,9 @@ class WorkerLifecycle:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS managed_worker_runtime_id
                     ON managed_workers(runtime_id) WHERE runtime_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS managed_worker_pending_control
+                    ON worker_operations(worker_id)
+                    WHERE completed=0 AND action IN ('drain','stop');
                 CREATE TABLE IF NOT EXISTS worker_executions (
                     worker_id TEXT NOT NULL,
                     execution_id TEXT NOT NULL,
@@ -370,6 +373,32 @@ class WorkerLifecycle:
         ):
             raise LifecycleConflict("Operation key is already bound to different input")
         return row
+
+    @staticmethod
+    def _pending_control(connection: sqlite3.Connection, worker_id: str):
+        return connection.execute(
+            "SELECT request_key,action FROM worker_operations WHERE worker_id=? "
+            "AND completed=0 AND action IN ('drain','stop') "
+            "ORDER BY CASE action WHEN 'stop' THEN 0 ELSE 1 END,rowid LIMIT 1",
+            (worker_id,),
+        ).fetchone()
+
+    def reconcile_control(self, scope: WorkerScope, worker_id: str) -> dict:
+        """Deliver at most one durable control intent from the trusted daemon.
+
+        This is an explicit mutation, never part of observe/discover. A busy
+        lock or uncertain driver response retains the original scoped request
+        for another pass. Stop takes priority over drain, and _control observes
+        terminal evidence before deciding whether another driver call is needed.
+        """
+        with self._transaction() as connection:
+            row = self._get(connection, scope, worker_id)
+            pending = self._pending_control(connection, worker_id)
+            if pending is None:
+                return self._view(connection, row)
+        return self._control(
+            scope, worker_id, pending["request_key"], pending["action"]
+        )
 
     def ensure_worker(self, spec: WorkerSpec) -> dict:
         payload = _json(asdict(spec))
@@ -524,11 +553,17 @@ class WorkerLifecycle:
         state = row["state"]
         if state == "ready" and active:
             state = "busy"
+        reason = row["reason"]
+        pending = self._pending_control(connection, row["worker_id"])
+        if pending is not None:
+            reason = pending["action"].capitalize() + " intent awaits runtime confirmation"
+            if row["reason"]:
+                reason += "; " + row["reason"]
         return {
             **spec,
             "worker_id": row["worker_id"],
             "state": state,
-            "reason": row["reason"],
+            "reason": reason,
             "termination_confirmed": bool(row["termination_confirmed"])
             and all(item["termination_confirmed"] for item in active),
             "artifacts_captured": bool(row["artifacts_captured"])
@@ -617,7 +652,7 @@ class WorkerLifecycle:
                 spec, runtime_id = WorkerSpec(**json.loads(row["spec"])), row["runtime_id"]
             if terminal:
                 self._complete(scope, request_key)
-                return observed
+                return self._current(scope, worker_id)
             if completed:
                 return observed
             try:
@@ -626,11 +661,13 @@ class WorkerLifecycle:
                     raise TypeError("invalid runtime response")
             except Exception:
                 observation = RuntimeObservation(
-                    "unknown", reason=f"{action.capitalize()} outcome unknown"
+                    "unknown", runtime_id=runtime_id,
+                    reason=f"{action.capitalize()} outcome unknown",
                 )
             result = self._apply(scope, worker_id, observation)
             if result["state"] != "unknown":
                 self._complete(scope, request_key)
+                return self._current(scope, worker_id)
             return result
 
     def drain_worker(self, scope: WorkerScope, worker_id: str, request_key: str) -> dict:
