@@ -3,6 +3,39 @@
 OpenJules is an open-source, asynchronous, cloud-agnostic equivalent of Google Jules.
 The system receives tasks from **GitHub issues/webhooks** or **Radicle peer-to-peer repositories (`rad:<rid>`)**, boots an isolated container sandbox (Docker-in-Docker / DinD), coordinates concurrent agents working on the same repository via **Keystone Polyphony**, executes an **Adaptive Agent Harness (Propose–Probe–Compose loop)** with **cloud or self-hosted LLMs (vLLM, llama.cpp, Ollama)**, and pushes the verified diff back as a **GitHub Pull Request** or **Radicle Patch**.
 
+## Managed deployment with ZPM
+
+Use the [managed service](docs/managed-service.md) for ZPM repository capacity.
+It connects the durable worker lifecycle to Polyphony's authenticated canonical
+authority and an [isolated Docker runtime](docs/managed-docker-runtime.md).
+The supported baseline executes one approved root command per immutable worker,
+preserves capture before release, and recovers delivery intents after restart.
+Source snapshots contain only the approved commit's objects; ignored host files
+and local Git configuration are excluded.
+
+An optional [coding agent and model broker](docs/managed-model-broker.md) connects
+that root execution to an explicitly configured provider. The broker retains
+provider credentials on the trusted host, binds requests to canonical permission
+and enforces shared call/token limits. Worker networking remains disabled.
+The default profile makes no model calls. Explicitly approved profiles can use
+[one level of bounded child agents](docs/managed-children.md) inside the same
+worker, with distinct UIDs, shared model limits and verified child capture before
+root release. Child expiry or cancellation retires the whole worker. Forge
+publication remains outside this managed service.
+
+An explicit child `outcome_protocol: initial-v1` profile can retain completed,
+declined, clarification-needed or failed self-reports for the original private
+instruction. The parent can read provisional reports, and final capture binds
+them to canonical child records for reconnect. This requires the paired
+Polyphony capability and the approved image; it adds no execution permission or
+second instruction round. See the [outcome contract](docs/managed-children.md#explicit-initial-instruction-outcomes).
+
+CI qualifies execution, recovery and the model transport against deterministic
+provider fixtures. A configured live provider and semantic task quality require
+their own qualification. The older webhook, in-memory collaboration and DinD
+paths described below do not satisfy this managed contract and are never used
+as a readiness fallback.
+
 ---
 
 ## Architecture Overview

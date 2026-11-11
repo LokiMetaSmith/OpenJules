@@ -1,0 +1,13 @@
+# Build the agent image from an operator-selected Python image. Pass a digest
+# through PYTHON_BASE for a reproducible base, then approve the output image ID.
+ARG PYTHON_BASE
+FROM ${PYTHON_BASE}
+RUN apt-get update && apt-get install --yes --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY src/agent/managed_runner.py /opt/openjules/managed_runner.py
+COPY src/agent/child_outcome.py /opt/openjules/child_outcome.py
+COPY src/agent/child_tools.py /opt/openjules/child_tools.py
+COPY src/agent/managed_root_runner.py /opt/openjules/managed_root_runner.py
+RUN chmod 0444 /opt/openjules/*.py
+ENV PYTHONDONTWRITEBYTECODE=1
+USER 65532
