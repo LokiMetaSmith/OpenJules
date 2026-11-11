@@ -202,6 +202,23 @@ OPENJULES_MANAGED_DOCKER_TESTS=1 \
   python -m pytest tests/integration/test_managed_children_runtime.py
 ```
 
+The direct sibling regression runs two actual child agents, then probes their
+private checkouts, instructions, generated patches, logs and production model
+sockets in both directions. Each probe uses the child's recorded UID and first
+proves access to its own files and socket. It requires permission denial for
+foreign reads, writes, mode changes and UID changes, plus an authenticated
+socket refusal. The root UID is also denied direct access to both children's
+files and model sockets; its approved result tools remain the way to obtain
+child contributions. These probes add no inference calls or turn reservations.
+
+The probes run after child exec return while the root container, child listeners
+and root/child execution references remain live. Final capture follows an
+explicit whole-worker retirement. This checks the documented UID/filesystem and
+socket boundaries inside one shared container. It does not establish separate
+kernels, process namespaces, resistance to kernel exploits or a multi-tenant
+sandbox. Actual Docker execution of this regression is a CI qualification;
+collection or a local skipped test does not establish those outcomes.
+
 These OpenJules tests use explicitly named canonical-authority and model
 fixtures. They do not establish real Polyphony service interoperability or live
 model quality. The installed three-service trial must additionally exercise the
